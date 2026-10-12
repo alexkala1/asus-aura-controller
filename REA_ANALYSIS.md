@@ -78,10 +78,41 @@ Using REA (`inspect_managed_artifact`, `open_binary`, `binary_session`):
   | `0x8000` | Direct Mode color buffer (RGB per zone) |
   | `0x8010` | Internal Effect color buffer |
   | `0x8020` | Direct mode enable |
-  | `0x8021` | Mode (0=Off, 1=Static, 2=Breathing, 3=Flash, 4=Spectrum, 5=Rainbow, etc.) |
-  | `0x8022` | Speed (0x00=Fastest to 0x04=Slowest) |
-  | `0x8023` | Direction (0=Forward, 1=Reverse) |
+  | `0x8021` | Mode (see Full Mode Table below) |
+  | `0x8022` | Speed (0x00=Fastest, 0x01=Fast, 0x02=Normal, 0x03=Slow, 0x04=Slowest) |
+  | `0x8023` | Direction (0x00=Forward, 0x01=Reverse) |
   | `0x80a0` | Apply (`0x01`) / Save (`0xaa`) |
+
+* **Full Motherboard Effect Mode Table**:
+  | Mode ID | Name | Parameters |
+  |---|---|---|
+  | `0` | Off | None |
+  | `1` | Static | Color buffer |
+  | `2` | Breathing | Color buffer, Speed |
+  | `3` | Flashing | Color buffer, Speed |
+  | `4` | Spectrum Cycle | Speed |
+  | `5` | Rainbow | Speed, Direction (Host board default) |
+  | `6` | Rainbow Breathing | Speed |
+  | `7` | Chase with Fade | Color, Speed, Direction |
+  | `8` | Spectrum Chase with Fade | Speed, Direction |
+  | `9` | Chase | Color, Speed, Direction |
+  | `10` | Spectrum Chase | Speed, Direction |
+  | `11` | Wave | Speed, Direction |
+  | `12` | Rainbow Pulse | Speed |
+  | `13` | Random Flicker | Speed |
+
+* **Empirically Read 5-LED Hardware Mapping (STRIX Z270E GAMING)**:
+  - Configuration bytes at `0x1c00`: `04 01 05 01 01 01 01 01 ... 85 85 85 85 86`
+  - Total LED Count: `5`
+  - LED 0..3: Channel `0x85` (`ENE_LED_CHANNEL_BACK_IO` - Back I/O Shroud)
+  - LED 4: Channel `0x86` (`ENE_LED_CHANNEL_RGB_HEADER` - 12V 4-pin RGB Header 1)
+
+* **CRITICAL Protocol Quirk: RBG Color Ordering**:
+  - In `LED_DLL_forMB_x64.dll` and decompiled ENE HAL, direct color buffers (`0x8000 + i*3`) do NOT use standard RGB.
+  - Byte 0: Red
+  - Byte 1: Blue
+  - Byte 2: Green
+  - Writing standard RGB results in swapped green/blue output. Drivers must pack colors as `(R, B, G)`.
 
 ---
 
@@ -90,4 +121,7 @@ Using REA (`inspect_managed_artifact`, `open_binary`, `binary_session`):
 1. **NvAPI Bypass on Linux**:
    On Windows, `LED_DLL_forMB_x64.dll` delegates to `Vender_x64.dll`, which loads `nvapi64.dll` and calls `NvAPI_I2CWriteEx` inside a user DX session. On Linux, this entire Windows IPC chain is unnecessary because the NVIDIA kernel driver exports `/dev/i2c-0` directly.
 2. **Super I/O Port Locking**:
-   On Linux, communicating with `0x02c0` requires raw port access (`/dev/port` with root/sudo or `iopl(3)` / `ioperm(3)`). Alternatively, compiling `i2c-nct6793-dkms` creates a native `/dev/i2c-N` bus adapter. Direct port access via `/dev/port` provides an immediate, zero-compilation user-space driver.
+   On Linux, communicating with `0x02c0` requires raw port access (`/dev/port` with root/sudo or `iopl(3)` / `ioperm(3)`). Direct port access via `/dev/port` provides an immediate, zero-compilation user-space driver.
+3. **Reference Controller Verification**:
+   The standalone tool [aura_ctl.py](file:///home/alexkala/repos/asus-aura-controller/aura_ctl.py) implements both the GPU and Motherboard protocols, with safety signature verification and comprehensive unit tests.
+
