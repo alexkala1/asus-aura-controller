@@ -5,8 +5,9 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use crate::protocol::{
     channel_name, pack_mobo_color, swap_reg16, MoboMode, MOBO_EXPECTED_NAME, MOBO_PORT_BASE,
-    MOBO_REG_APPLY, MOBO_REG_COLORS_DIRECT, MOBO_REG_CONFIG, MOBO_REG_DIRECT, MOBO_REG_DIRECTION,
-    MOBO_REG_MODE, MOBO_REG_NAME, MOBO_REG_SPEED, MOBO_SLAVE_ADDR,
+    MOBO_REG_APPLY, MOBO_REG_COLORS_DIRECT, MOBO_REG_COLORS_EFFECT, MOBO_REG_CONFIG,
+    MOBO_REG_DIRECT, MOBO_REG_DIRECTION, MOBO_REG_MODE, MOBO_REG_NAME, MOBO_REG_SPEED,
+    MOBO_SLAVE_ADDR,
 };
 
 pub trait PortIo {
@@ -92,6 +93,22 @@ pub struct MoboStatus {
     pub speed: u8,
     pub direction: String,
     pub zones: Vec<MoboZone>,
+}
+
+/// The effect color buffer is 16 bytes (0x8010..0x8020), so only 5 LEDs fit before
+/// the direct-mode flag at 0x8020.
+const EFFECT_LED_LIMIT: u8 = 5;
+
+/// Raw register snapshot of everything the MCP agent-state patterns overwrite.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MoboSnapshot {
+    pub direct: u8,
+    pub mode: u8,
+    pub speed: u8,
+    pub direction: u8,
+    /// Direct and effect buffers in raw ENE byte order (red, blue, green).
+    pub direct_colors: Vec<[u8; 3]>,
+    pub effect_colors: Vec<[u8; 3]>,
 }
 
 pub struct MoboController<P: PortIo> {
@@ -193,10 +210,9 @@ impl<P: PortIo> MoboController<P> {
 
     fn ene_write_reg(&mut self, reg: u16, val: u8) -> Result<(), String> {
         if self.dry_run {
-            return writeln!(
-                io::stdout().lock(),
+            return crate::protocol::dry_run_log(&format!(
                 "[DRY-RUN] Mobo Write: Reg 0x{reg:04x} <= 0x{val:02x}"
-            )
+            ))
             .map_err(|e| e.to_string());
         }
         self.smbus_write_word(0x00, swap_reg16(reg))
@@ -291,6 +307,97 @@ impl<P: PortIo> MoboController<P> {
     pub fn set_mode(&mut self, mode: MoboMode, speed: u8, direction: u8) -> Result<(), String> {
         self.verify()?;
         self.write_mode(mode, speed, direction)
+    }
+
+    /// Static color on one zone; other zones keep their direct-buffer colors.
+    pub fn set_zone_color(&mut self, zone: u8, r: u8, g: u8, b: u8) -> Result<(), String> {
+        self.verify()?;
+        let count = self.led_count()?;
+        if zone >= count {
+            return Err(format!("Zone {zone} out of range (0..{})", count - 1));
+        }
+        self.ene_write_reg(MOBO_REG_DIRECT, 1)?;
+        for (offset, byte) in pack_mobo_color(r, g, b).into_iter().enumerate() {
+            self.ene_write_reg(
+                MOBO_REG_COLORS_DIRECT + 3 * u16::from(zone) + offset as u16,
+                byte,
+            )?;
+        }
+        self.write_mode(MoboMode::Static, 0, 0)
+    }
+
+    /// Animated effect, optionally with the colors that color-driven effects use.
+    pub fn set_effect(
+        &mut self,
+        mode: MoboMode,
+        speed: u8,
+        color: Option<(u8, u8, u8)>,
+    ) -> Result<(), String> {
+        self.verify()?;
+        let count = self.led_count()?.min(EFFECT_LED_LIMIT);
+        self.ene_write_reg(MOBO_REG_DIRECT, 0)?;
+        if let Some((r, g, b)) = color {
+            for i in 0..count {
+                for (offset, byte) in pack_mobo_color(r, g, b).into_iter().enumerate() {
+                    self.ene_write_reg(
+                        MOBO_REG_COLORS_EFFECT + 3 * u16::from(i) + offset as u16,
+                        byte,
+                    )?;
+                }
+            }
+        }
+        self.write_mode(mode, speed, 0)
+    }
+
+    pub fn snapshot(&mut self) -> Result<MoboSnapshot, String> {
+        self.verify()?;
+        let count = self.led_count()?;
+        let read_colors = |this: &mut Self, base: u16, leds: u8| -> Result<Vec<[u8; 3]>, String> {
+            let mut colors = Vec::new();
+            for i in 0..leds {
+                let reg = base + 3 * u16::from(i);
+                colors.push([
+                    this.ene_read_reg(reg)?,
+                    this.ene_read_reg(reg + 1)?,
+                    this.ene_read_reg(reg + 2)?,
+                ]);
+            }
+            Ok(colors)
+        };
+        let direct_colors = read_colors(self, MOBO_REG_COLORS_DIRECT, count)?;
+        let effect_colors = read_colors(self, MOBO_REG_COLORS_EFFECT, count.min(EFFECT_LED_LIMIT))?;
+        Ok(MoboSnapshot {
+            direct: self.ene_read_reg(MOBO_REG_DIRECT)?,
+            mode: self.ene_read_reg(MOBO_REG_MODE)?,
+            speed: self.ene_read_reg(MOBO_REG_SPEED)?,
+            direction: self.ene_read_reg(MOBO_REG_DIRECTION)?,
+            direct_colors,
+            effect_colors,
+        })
+    }
+
+    pub fn restore(&mut self, snapshot: &MoboSnapshot) -> Result<(), String> {
+        self.verify()?;
+        for (base, colors) in [
+            (MOBO_REG_COLORS_DIRECT, &snapshot.direct_colors),
+            (MOBO_REG_COLORS_EFFECT, &snapshot.effect_colors),
+        ] {
+            for (i, rbg) in colors.iter().enumerate() {
+                for (offset, byte) in rbg.iter().enumerate() {
+                    self.ene_write_reg(base + 3 * i as u16 + offset as u16, *byte)?;
+                }
+            }
+        }
+        for (reg, val) in [
+            (MOBO_REG_DIRECT, snapshot.direct),
+            (MOBO_REG_MODE, snapshot.mode),
+            (MOBO_REG_SPEED, snapshot.speed),
+            (MOBO_REG_DIRECTION, snapshot.direction),
+            (MOBO_REG_APPLY, 1),
+        ] {
+            self.ene_write_reg(reg, val)?;
+        }
+        Ok(())
     }
 }
 
@@ -403,6 +510,103 @@ mod tests {
             expected.extend([(0x8021, 1), (0x8022, 0), (0x8023, 0), (0x80A0, 1)]);
             assert_eq!(ctl.port.writes, expected);
         }
+    }
+
+    #[test]
+    fn zone_color_writes_one_zone_and_rejects_out_of_range() {
+        let mut ctl = MoboController::new(MockPort::valid(5), false);
+        ctl.set_zone_color(2, 0x11, 0x22, 0x33).unwrap();
+        assert_eq!(
+            ctl.port.writes,
+            vec![
+                (0x8020, 1),
+                (0x8006, 0x11),
+                (0x8007, 0x33),
+                (0x8008, 0x22),
+                (0x8021, 1),
+                (0x8022, 0),
+                (0x8023, 0),
+                (0x80A0, 1)
+            ]
+        );
+        let mut ctl = MoboController::new(MockPort::valid(5), false);
+        assert!(ctl
+            .set_zone_color(5, 1, 2, 3)
+            .unwrap_err()
+            .contains("out of range"));
+        assert!(ctl.port.writes.is_empty());
+    }
+
+    #[test]
+    fn effect_leaves_direct_mode_and_never_overruns_the_effect_buffer() {
+        // 16 configured LEDs must still stop at 5 (0x8010..0x801F) so 0x8020 is untouched.
+        let mut ctl = MoboController::new(MockPort::valid(255), false);
+        ctl.set_effect(MoboMode::Wave, 3, Some((0x11, 0x22, 0x33)))
+            .unwrap();
+        let writes = &ctl.port.writes;
+        assert_eq!(writes[0], (0x8020, 0));
+        assert_eq!(
+            writes[1..4],
+            [(0x8010, 0x11), (0x8011, 0x33), (0x8012, 0x22)]
+        );
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|(reg, _)| (0x8010..0x8020).contains(reg))
+                .count(),
+            15
+        );
+        assert_eq!(writes.iter().filter(|(reg, _)| *reg == 0x8020).count(), 1);
+        assert_eq!(
+            writes[16..],
+            [(0x8021, 11), (0x8022, 3), (0x8023, 0), (0x80A0, 1)]
+        );
+
+        let mut ctl = MoboController::new(MockPort::valid(5), false);
+        ctl.set_effect(MoboMode::Rainbow, 0, None).unwrap();
+        assert_eq!(ctl.port.writes[0], (0x8020, 0));
+        assert_eq!(
+            ctl.port.writes.len(),
+            5,
+            "no color buffer writes without a color"
+        );
+    }
+
+    #[test]
+    fn snapshot_restore_round_trips_registers() {
+        let mut port = MockPort::valid(5);
+        for (reg, val) in [
+            (0x8000, 1),
+            (0x8001, 2),
+            (0x8002, 3),
+            (0x8010, 7),
+            (0x8014, 9),
+            (0x8020, 1),
+            (0x8021, 11),
+            (0x8022, 2),
+            (0x8023, 1),
+        ] {
+            port.regs.insert(reg, val);
+        }
+        let mut ctl = MoboController::new(port, false);
+        let snapshot = ctl.snapshot().unwrap();
+        assert_eq!(
+            (
+                snapshot.direct,
+                snapshot.mode,
+                snapshot.speed,
+                snapshot.direction
+            ),
+            (1, 11, 2, 1)
+        );
+        assert_eq!(snapshot.direct_colors.len(), 5);
+        assert_eq!(snapshot.direct_colors[0], [1, 2, 3]);
+        assert_eq!(snapshot.effect_colors[0], [7, 0, 0]);
+
+        ctl.set_effect(MoboMode::Breathing, 0, Some((0xff, 0xb0, 0)))
+            .unwrap();
+        ctl.restore(&snapshot).unwrap();
+        assert_eq!(ctl.snapshot().unwrap(), snapshot);
     }
 
     #[test]

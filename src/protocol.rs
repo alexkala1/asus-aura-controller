@@ -1,5 +1,23 @@
 //! Hardware-free constants and conversions for ASUS Aura controllers.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static DRY_RUN_LOG_TO_STDERR: AtomicBool = AtomicBool::new(false);
+
+/// MCP owns stdout for JSON-RPC, so dry-run write traces must move to stderr.
+pub fn route_dry_run_log_to_stderr() {
+    DRY_RUN_LOG_TO_STDERR.store(true, Ordering::Relaxed);
+}
+
+pub fn dry_run_log(line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    if DRY_RUN_LOG_TO_STDERR.load(Ordering::Relaxed) {
+        writeln!(std::io::stderr().lock(), "{line}")
+    } else {
+        writeln!(std::io::stdout().lock(), "{line}")
+    }
+}
+
 pub const GPU_I2C_DEV: &str = "/dev/i2c-0";
 pub const GPU_I2C_ADDR: u8 = 0x29;
 pub const GPU_MAGIC_HIGH: u8 = 0x15;

@@ -1,4 +1,5 @@
 mod gpu;
+mod mcp;
 mod mobo;
 mod protocol;
 
@@ -21,6 +22,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Serve lighting tools to coding agents over MCP (JSON-RPC on stdio).
+    Mcp,
     Status,
     Gpu {
         #[arg(long)]
@@ -110,6 +113,7 @@ fn human_status(gpu: &GpuStatus, mobo: &MoboStatus) -> String {
 pub fn run(cli: Cli) -> Result<String, String> {
     let dry = cli.dry_run;
     match cli.command {
+        Command::Mcp => Err("`mcp` runs as a server; start it from main".to_owned()),
         Command::Status => {
             let gpu = gpu_controller(dry)?.status()?;
             let mobo = mobo_controller(dry)?.status()?;
@@ -195,7 +199,15 @@ pub fn run(cli: Cli) -> Result<String, String> {
 }
 
 fn main() {
-    let result = run(Cli::parse())
+    let cli = Cli::parse();
+    if matches!(cli.command, Command::Mcp) {
+        if let Err(message) = mcp::serve(cli.dry_run) {
+            let _ = writeln!(io::stderr().lock(), "error: {message}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    let result = run(cli)
         .and_then(|text| writeln!(io::stdout().lock(), "{text}").map_err(|e| e.to_string()));
     if let Err(message) = result {
         let _ = writeln!(io::stderr().lock(), "error: {message}");
@@ -224,6 +236,7 @@ mod cli_tests {
             vec!["aura", "mobo", "--mode", "rainbow-breathing"],
             vec!["aura", "all", "--off"],
             vec!["aura", "all", "--color", "112233", "--mode", "rainbow"],
+            vec!["aura", "--dry-run", "mcp"],
         ] {
             assert!(Cli::try_parse_from(args).is_ok());
         }

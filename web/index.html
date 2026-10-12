@@ -5,41 +5,46 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>Aura • Lighting studio</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
   <link rel="stylesheet" href="style.css">
   <script src="app.js" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#channels">Skip to lighting controls</a>
   <header class="topbar">
-    <a class="brand" href="index.html" aria-label="Aura lighting studio home"><span class="brand-mark" aria-hidden="true">A</span> AURA<span class="brand-sub">LIGHTING STUDIO</span></a>
-    <div class="mode-switch-group" role="radiogroup" aria-label="Operating Mode">
-      <button id="mode-live" class="mode-pill active" type="button" role="radio" aria-checked="true">
-        <span class="status-dot live" aria-hidden="true"></span> Live Hardware
-      </button>
-      <button id="mode-sim" class="mode-pill" type="button" role="radio" aria-checked="false">
-        <span class="status-dot sim" aria-hidden="true"></span> Simulation
-      </button>
+    <a class="brand" href="index.html" aria-label="Aura Lighting Studio home">
+      <svg class="brand-mark" viewBox="0 0 64 64" aria-hidden="true">
+        <defs><linearGradient id="aura-spectrum" x1="4" y1="60" x2="60" y2="4" gradientUnits="userSpaceOnUse"><stop class="logo-start"/><stop class="logo-end" offset="1"/></linearGradient></defs>
+        <g fill="url(#aura-spectrum)"><path d="M4 60V32L32 4 42 14 18 38V46Z"/><path d="M32 4 60 32V60L46 46V32L32 18 25 25 18 18Z"/><path d="M18 46 32 32 46 46V54L32 40 18 54Z"/></g>
+        <path class="logo-facet" d="M32 4 42 14 18 38V32Z"/>
+      </svg>
+      <span class="brand-wordmark">AURA<span>LIGHTING STUDIO</span></span>
+    </a>
+    <div class="connection" data-state="loading" role="status" aria-live="polite">
+      <strong id="live-status">● CONNECTING</strong>
+      <span id="daemon-status">Daemon :7890 · checking devices</span>
     </div>
   </header>
   <main>
     <section class="intro" aria-labelledby="page-title">
-      <div><p class="eyebrow">YOUR HARDWARE. YOUR SIGNATURE.</p><h1 id="page-title">Make it <em>glow.</em></h1><p class="lede">One workspace for your ROG lighting. Dial in a color, explore an effect, and preview every LED.</p></div>
+      <div><p class="eyebrow">ROG / HARDWARE CONTROL</p><h1 id="page-title">Light with <span>intent.</span></h1><p class="lede">Two devices. One lighting signature. Set your colors and effects, then apply them directly to your hardware.</p></div>
       <div class="sync-panel">
         <label class="switch-label" for="sync-all"><span><strong>Sync All</strong><small>One look across every channel</small></span><input id="sync-all" type="checkbox" role="switch"><span class="switch-track" aria-hidden="true"></span></label>
         <p id="sync-state" aria-live="polite">Independent channels</p>
       </div>
     </section>
 
-    <div class="section-heading"><h2>Lighting channels <span>06</span></h2><label class="motion-control"><input id="animate" type="checkbox" checked> Animate previews</label></div>
+    <div class="section-heading"><h2>Connected hardware</h2><button id="btn-refresh" class="btn btn-secondary" type="button">Refresh devices</button></div>
+    <p id="connection-help" class="connection-help" role="status">Connecting to the hardware daemon. Controls unlock after device verification.</p>
     <section id="channels" class="devices" aria-label="Device lighting controls">
       <section class="device-panel gpu-panel" aria-labelledby="gpu-title">
-        <header class="device-heading"><div><p class="eyebrow">GRAPHICS CARD</p><h2 id="gpu-title">ROG Strix GTX 1060</h2></div><span class="device-number">01</span></header>
+        <header class="device-heading"><div><p class="eyebrow">01 / GRAPHICS CARD</p><h2 id="gpu-title">NVIDIA GTX 1060 6GB</h2><p class="hardware-address">ROG STRIX · /dev/i2c-0:0x29</p></div><span id="gpu-state" class="device-state">Checking</span></header>
         <div class="gpu-hardware" aria-hidden="true"><div class="gpu-edge"></div><div class="fans"><span class="fan"></span><span class="fan"></span><span class="fan"></span></div><span class="hardware-caption">ROG STRIX <b>GEFORCE GTX 1060</b></span></div>
         <div id="gpu-controls"></div>
-        <p class="device-footnote">GPU Aura · 1 lighting channel</p>
+        <p class="device-footnote">GPU magic 0x1589 · fixed hardware effect speed</p>
       </section>
       <section class="device-panel mobo-panel" aria-labelledby="mobo-title">
-        <header class="device-heading"><div><p class="eyebrow">MOTHERBOARD</p><h2 id="mobo-title">ROG STRIX Z270E</h2><p class="model-detail">GAMING</p></div><span class="device-number">02</span></header>
+        <header class="device-heading"><div><p class="eyebrow">02 / MOTHERBOARD</p><h2 id="mobo-title">ASUS ROG STRIX Z270E GAMING</h2><p class="hardware-address">0x02c0:0x4e · FW <span id="firmware">unverified</span></p></div><span id="mobo-state" class="device-state">Checking</span></header>
         <div class="board-map" aria-hidden="true"><div class="io-strip"><span></span><span></span><span></span><span></span></div><div class="cpu-socket"><span>ROG<br>STRIX</span></div><div class="ram-slots"><i></i><i></i><i></i><i></i></div><div class="pci-slot"></div><div class="header-strip"></div><span class="board-caption">BACK I/O + RGB HEADER</span></div>
         <div class="zone-heading"><h3>Onboard zones</h3><span>4 × Back I/O / 1 × Header</span></div>
         <div id="mobo-controls" class="zone-grid"></div>
@@ -48,22 +53,22 @@
 
     <section class="command-panel" aria-labelledby="command-title">
       <header><div><p class="eyebrow">COMMAND &amp; CONTROL</p><h2 id="command-title">Hardware Command</h2></div><span id="command-target">GPU channel</span></header>
-      <pre><code id="command-preview"></code></pre>
+      <pre><code id="command-preview" aria-live="polite"></code></pre>
       <div class="command-actions">
-        <button id="btn-apply" class="btn btn-apply" type="button">⚡ Apply to Hardware</button>
-        <button id="btn-copy" class="btn btn-secondary" type="button">📋 Copy Command</button>
+        <button id="btn-apply" class="btn btn-apply" type="button" disabled>Apply to hardware</button>
+        <button id="btn-copy" class="btn btn-secondary" type="button" disabled>Copy command</button>
         <div id="status-toast" class="toast" role="status" aria-live="polite"></div>
       </div>
-      <p id="command-note">Live Hardware Mode: Commands apply directly to GTX 1060 and Z270E motherboard.</p>
-      <p class="command-help">Zone colors are simulated on this dashboard. The hardware applies the selected color across onboard motherboard LEDs.</p>
+      <p id="command-note">Choose a verified device to stage a hardware command.</p>
+      <p class="command-help">Motherboard controls apply to every onboard LED. Effect modes retain the device's existing effect colors. Sync All uses the CLI's default effect speed.</p>
     </section>
-    <footer><span>AURA / LOCAL LIGHTING STUDIO</span><span>6 channels. Infinite combinations.</span></footer>
+    <footer><span>AURA LIGHTING STUDIO</span><span>LOCAL DAEMON / :7890</span></footer>
   </main>
   <template id="channel-template">
     <article class="channel-card">
       <div class="channel-header"><h3></h3><span class="channel-id"></span></div>
       <div class="led-preview" aria-hidden="true"><span class="led-bar"></span><span class="preview-wordmark"></span></div>
-      <div class="controls">
+      <div class="controls" data-state="loading">
         <label class="color-control"><span>Color</span><div class="color-field"><input class="color-picker" type="color"><output class="hex-value"></output></div></label>
         <label class="mode-control"><span>Effect</span><select class="mode-picker"></select></label>
         <label class="speed-control"><span>Speed <output class="speed-value">0</output></span><input class="speed-slider" type="range" min="0" max="4" step="1" value="0"><small>Fast <span>Slow</span></small></label>

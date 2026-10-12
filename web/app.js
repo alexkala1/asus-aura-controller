@@ -1,6 +1,5 @@
 "use strict";
 
-// Display names map to the existing CLI's GPU/motherboard effect vocabulary.
 const modes = [
   ["static", "Static", "static"], ["breathing", "Breathing", "breathing"],
   ["strobing", "Strobing", "flashing"], ["color-cycle", "Color cycle", "spectrum"],
@@ -11,205 +10,252 @@ const modes = [
 ];
 const gpuModes = new Set(["static", "breathing", "flashing", "spectrum", "off"]);
 const channels = [
-  { id: "gpu", name: "GTX 1060 logo", tag: "GPU", color: "#ff835b", mode: "static", speed: 0 },
-  ...Array.from({ length: 5 }, (_, zone) => ({
-    id: `zone-${zone}`, name: zone < 4 ? `Back I/O · Zone ${zone}` : "RGB Header · Zone 4",
-    tag: `0${zone}`, color: "#ff835b", mode: "static", speed: 0,
-  })),
+  { id: "gpu", name: "GTX 1060 logo", tag: "GPU", color: null, mode: "static", speed: 0 },
+  ...Array.from({ length: 5 }, (_, zone) => ({ id: `zone-${zone}`, name: zone < 4 ? `Back I/O · Zone ${zone}` : "RGB Header · Zone 4", tag: `0${zone}`, color: null, mode: "static", speed: 0 })),
 ];
+const $ = selector => document.querySelector(selector);
 let active = channels[0];
-const sync = document.querySelector("#sync-all");
-const command = document.querySelector("#command-preview");
-const template = document.querySelector("#channel-template");
+let connected = false;
+let busy = false;
+let dirty = false;
+let refreshing = false;
+const sync = $("#sync-all");
+const apply = $("#btn-apply");
+const copy = $("#btn-copy");
+const refresh = $("#btn-refresh");
 
 for (const channel of channels) {
-  const card = template.content.firstElementChild.cloneNode(true);
+  const card = $("#channel-template").content.firstElementChild.cloneNode(true);
   card.id = channel.id;
   card.dataset.channel = channel.id;
   card.querySelector("h3").textContent = channel.name;
   card.querySelector(".channel-id").textContent = channel.tag;
   card.querySelector(".preview-wordmark").textContent = "GTX 1060";
-  for (const [selector, suffix, label] of [
-    [".color-picker", "color", "color"], [".mode-picker", "mode", "effect"], [".speed-slider", "speed", "speed"],
-  ]) {
+  for (const [selector, suffix, label] of [[".color-picker", "color", "color"], [".mode-picker", "mode", "effect"], [".speed-slider", "speed", "speed"]]) {
     const input = card.querySelector(selector);
     input.id = `${channel.id}-${suffix}`;
     input.setAttribute("aria-label", `${channel.name} ${label}`);
+    input.setAttribute("aria-describedby", "connection-help command-note");
     input.closest("label").htmlFor = input.id;
+    input.disabled = true;
   }
-  for (const [value, label] of modes) {
-    card.querySelector(".mode-picker").add(new Option(label, value));
-  }
+  for (const [value, label] of modes) card.querySelector(".mode-picker").add(new Option(label, value));
   channel.card = card;
   const update = (key, value) => {
+    if (!connected || busy) return;
     active = channel;
     channel[key] = value;
-    if (sync.checked) mirror(channel);
+    // The CLI writes motherboard settings device-wide, never per zone.
+    const linked = sync.checked ? channels : channel.id === "gpu" ? [channel] : channels.slice(1);
+    for (const target of linked) {
+      target[key] = value;
+      if (key === "mode") target.nativeMode = null;
+    }
+    dirty = true;
+    setControlState("default");
+    notify("Changes staged. Apply to update hardware.", "default");
     render();
   };
   card.querySelector(".color-picker").addEventListener("input", event => update("color", event.target.value));
   card.querySelector(".mode-picker").addEventListener("change", event => update("mode", event.target.value));
   card.querySelector(".speed-slider").addEventListener("input", event => update("speed", Number(event.target.value)));
   card.addEventListener("focusin", () => { active = channel; renderCommand(); markActive(); });
-  document.querySelector(channel.id === "gpu" ? "#gpu-controls" : "#mobo-controls").append(card);
-}
-
-function mirror(source) {
-  for (const channel of channels) {
-    Object.assign(channel, { color: source.color, mode: source.mode, speed: source.speed });
-  }
+  $(channel.id === "gpu" ? "#gpu-controls" : "#mobo-controls").append(card);
 }
 
 function markActive() {
-  for (const channel of channels) channel.card.classList.toggle("selected", channel === active || sync.checked);
+  for (const channel of channels) channel.card.classList.toggle("selected", connected && (sync.checked || channel === active));
+}
+
+function setControlState(state) {
+  for (const element of document.querySelectorAll("input, select, button, .controls")) {
+    element.dataset.state = state;
+    element.setAttribute("aria-busy", String(state === "loading"));
+    if (element.matches("input, select")) element.setAttribute("aria-invalid", String(state === "error"));
+  }
+}
+
+function lockControls() {
+  for (const channel of channels) {
+    for (const input of channel.card.querySelectorAll("input, select")) input.disabled = !connected || busy;
+    if (channel.id === "gpu") channel.card.querySelector(".speed-slider").disabled = true;
+  }
+  sync.disabled = !connected || busy;
+  apply.disabled = !connected || busy || refreshing;
+  copy.disabled = !connected || busy;
+  refresh.disabled = busy || refreshing;
 }
 
 function render() {
   for (const channel of channels) {
     const card = channel.card;
-    card.style.setProperty("--led", channel.color);
+    card.style.setProperty("--led", channel.color || "var(--led-off)");
     card.style.setProperty("--duration", `${3 + channel.speed * 1.5}s`);
-    card.dataset.mode = channel.mode;
-    card.querySelector(".color-picker").value = channel.color;
-    card.querySelector(".hex-value").textContent = channel.color.toUpperCase();
+    card.dataset.mode = channel.color ? channel.mode : "off";
+    if (channel.color) card.querySelector(".color-picker").value = channel.color;
+    card.querySelector(".hex-value").textContent = channel.color ? channel.color.toUpperCase() : "—";
     card.querySelector(".mode-picker").value = channel.mode;
     card.querySelector(".speed-slider").value = channel.speed;
-    card.querySelector(".speed-value").textContent = channel.speed;
+    card.querySelector(".speed-value").textContent = channel.id === "gpu" ? "Fixed" : channel.speed;
   }
-  document.querySelector(".gpu-hardware").style.setProperty("--gpu-led", channels[0].mode === "off" ? "#30353e" : channels[0].color);
-  document.querySelectorAll(".io-strip span").forEach((led, index) => {
-    led.style.setProperty("--zone-led", channels[index + 1].mode === "off" ? "#30353e" : channels[index + 1].color);
-  });
-  document.querySelector(".header-strip").style.setProperty("--zone-led", channels[5].mode === "off" ? "#30353e" : channels[5].color);
-  document.querySelector("#sync-state").textContent = sync.checked ? "All 6 channels linked" : "Independent channels";
+  const led = channel => channel.mode === "off" || !channel.color ? "var(--led-off)" : channel.color;
+  $(".gpu-hardware").style.setProperty("--gpu-led", led(channels[0]));
+  document.querySelectorAll(".io-strip span").forEach((element, index) => element.style.setProperty("--zone-led", led(channels[index + 1])));
+  $(".header-strip").style.setProperty("--zone-led", led(channels[5]));
+  $("#sync-state").textContent = sync.checked ? "Both devices linked" : "Control each device independently";
   markActive();
   renderCommand();
+  lockControls();
 }
 
-let isLiveMode = true;
-const modeLiveBtn = document.querySelector("#mode-live");
-const modeSimBtn = document.querySelector("#mode-sim");
-const btnApply = document.querySelector("#btn-apply");
-const btnCopy = document.querySelector("#btn-copy");
-const toast = document.querySelector("#status-toast");
-
-function setMode(live) {
-  isLiveMode = live;
-  if (modeLiveBtn && modeSimBtn) {
-    modeLiveBtn.classList.toggle("active", live);
-    modeLiveBtn.setAttribute("aria-checked", String(live));
-    modeSimBtn.classList.toggle("active", !live);
-    modeSimBtn.setAttribute("aria-checked", String(!live));
-  }
-  if (btnApply) {
-    btnApply.textContent = live ? "⚡ Apply to Hardware" : "🧪 Test Dry-Run";
-  }
-  renderCommand();
-}
-
-if (modeLiveBtn) modeLiveBtn.addEventListener("click", () => setMode(true));
-if (modeSimBtn) modeSimBtn.addEventListener("click", () => setMode(false));
-
-function showToast(msg, type = "success") {
-  if (!toast) return;
-  toast.textContent = msg;
-  toast.className = `toast ${type}`;
-  toast.style.display = "inline-block";
-  setTimeout(() => { toast.style.display = "none"; }, 4000);
+function selection() {
+  const target = sync.checked ? "all" : active.id === "gpu" ? "gpu" : "mobo";
+  const mapped = active.nativeMode || modes.find(([key]) => key === active.mode)[2];
+  const mode = target === "gpu" && !gpuModes.has(mapped) ? "static" : mapped;
+  return { target, mode, color: active.color?.slice(1), speed: active.speed, off: active.mode === "off" };
 }
 
 function renderCommand() {
-  const target = sync.checked ? "all" : active.id === "gpu" ? "gpu" : "mobo";
-  const mappedMode = modes.find(([key]) => key === active.mode)[2];
-  const nativeMode = target === "gpu" && !gpuModes.has(mappedMode) ? "static" : mappedMode;
-  const args = isLiveMode ? ["sudo", "asus-aura-cli", target] : ["asus-aura-cli", "--dry-run", target];
-  if (active.mode === "off") args.push("--off");
+  if (!active.color) {
+    $("#command-preview").textContent = "Waiting for verified hardware…";
+    return;
+  }
+  const { target, mode, color, speed, off } = selection();
+  const args = ["sudo", "asus-aura-cli", target];
+  if (off) args.push("--off");
   else {
-    args.push("--color", active.color.slice(1), "--mode", nativeMode);
-    if (target === "mobo") args.push("--speed", active.speed);
+    args.push("--color", color, "--mode", mode);
+    if (target === "mobo") args.push("--speed", speed);
   }
-  command.textContent = args.join(" ");
-  document.querySelector("#command-target").textContent = sync.checked ? "All devices" : active.name;
-  let note = isLiveMode
-    ? "Live Hardware Mode: Commands apply directly to your GTX 1060 and Z270E motherboard."
-    : "Simulation Mode: Previews command safely without touching hardware.";
-  if (target === "gpu" && nativeMode !== mappedMode) note += ` (GPU uses static color for ${active.mode}).`;
-  document.querySelector("#command-note").textContent = note;
+  $("#command-preview").textContent = args.join(" ");
+  $("#command-target").textContent = sync.checked ? "Both devices" : active.name;
+  $("#command-note").textContent = target === "gpu" && mode !== modes.find(([key]) => key === active.mode)[2]
+    ? `GPU uses static color for ${active.mode}; that effect is motherboard-only.`
+    : target === "mobo" ? "Applies to all motherboard LEDs. Static color and off ignore speed."
+    : target === "all" ? "Applies to both devices. Motherboard-only effects use static color on the GPU."
+    : "Applies to the GTX 1060. GPU effect speed is fixed by hardware.";
 }
 
-if (btnApply) {
-  btnApply.addEventListener("click", async () => {
-    const target = sync.checked ? "all" : active.id === "gpu" ? "gpu" : "mobo";
-    const mappedMode = modes.find(([key]) => key === active.mode)[2];
-    const nativeMode = target === "gpu" && !gpuModes.has(mappedMode) ? "static" : mappedMode;
-    btnApply.disabled = true;
-    btnApply.textContent = "Applying...";
-    try {
-      const resp = await fetch("/api/apply", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          target,
-          dry_run: !isLiveMode,
-          color: active.color.slice(1),
-          mode: nativeMode,
-          speed: active.speed,
-          off: active.mode === "off"
-        })
-      });
-      const data = await resp.json();
-      if (data.ok) {
-        showToast(isLiveMode ? "⚡ Applied to Hardware!" : "🧪 Dry-Run Passed!", "success");
-      } else {
-        showToast(`Error: ${data.error || "Failed to apply"}`, "error");
-      }
-    } catch (e) {
-      showToast(`Server not responding: Run 'python3 web/serve.py'`, "error");
-    } finally {
-      btnApply.disabled = false;
-      btnApply.textContent = isLiveMode ? "⚡ Apply to Hardware" : "🧪 Test Dry-Run";
-    }
-  });
+function notify(message, state) {
+  $("#status-toast").textContent = message;
+  $("#status-toast").dataset.state = state;
 }
 
-if (btnCopy) {
-  btnCopy.addEventListener("click", () => {
-    navigator.clipboard.writeText(command.textContent).then(
-      () => showToast("📋 Command copied to clipboard!", "success"),
-      () => showToast("Failed to copy", "error")
-    );
-  });
+async function api(path, options = {}) {
+  const response = await fetch(path, { ...options, signal: AbortSignal.timeout(12000) });
+  const data = await response.json();
+  if (!response.ok || !data.ok) throw new Error(data.error || `Daemon request failed (${response.status}).`);
+  return data;
 }
 
-// Initial fetch from live hardware status if API is available
-async function initLiveStatus() {
-  if (window.location.protocol === "file:") return;
+function hardwareData(data) {
+  const gpu = data?.gpu;
+  const mobo = data?.motherboard;
+  const validHex = value => typeof value === "string" && /^[0-9a-f]{6}$/i.test(value);
+  if (gpu?.magic_verified !== true || gpu.bus !== "/dev/i2c-0" || gpu.address !== "0x29"
+      || !validHex(gpu.color_hex) || !mobo?.firmware?.startsWith("LED-0116")
+      || mobo.smbus_port !== "0x02c0" || mobo.slave_address !== "0x4e"
+      || mobo.led_count !== 5 || !Array.isArray(mobo.zones) || mobo.zones.length !== 5
+      || !mobo.zones.every((zone, i) => zone.led_index === i && validHex(zone.hex))) {
+    throw new Error("Hardware identity or LED data could not be verified. Check the daemon and device connections.");
+  }
+  const aliases = { "rainbow-breathing": "breathing", chase: "comet", "spectrum-chase": "flash-and-dash" };
+  const displayMode = value => {
+    const native = typeof value === "string" ? value.replaceAll("_", "-") : "";
+    return modes.find(([, , name]) => name === native)?.[0] || aliases[native];
+  };
+  if (!displayMode(gpu.mode) || !displayMode(mobo.mode)) throw new Error("Unsupported hardware effect reported. Refresh after selecting a supported CLI mode.");
+  if (!Number.isInteger(mobo.speed) || mobo.speed < 0 || mobo.speed > 4) throw new Error("Hardware effect speed is outside the supported range.");
+  return { gpu, mobo, gpuMode: displayMode(gpu.mode), moboMode: displayMode(mobo.mode) };
+}
+
+async function refreshStatus() {
+  if (busy || refreshing) return;
+  refreshing = true;
+  refresh.textContent = "Checking devices…";
+  refresh.dataset.state = "loading";
+  if (!connected) setControlState("loading");
+  lockControls();
   try {
-    const resp = await fetch("/api/status");
-    const json = await resp.json();
-    if (json.ok && json.data) {
-      const gpu = json.data.gpu;
-      if (gpu && gpu.color_hex) {
-        channels[0].color = "#" + gpu.color_hex;
-        if (gpu.mode) channels[0].mode = gpu.mode;
-      }
-      const mobo = json.data.motherboard;
-      if (mobo && mobo.zones) {
-        mobo.zones.forEach((z, i) => {
-          if (channels[i + 1] && z.hex) channels[i + 1].color = "#" + z.hex;
-        });
-      }
-      render();
+    if (location.protocol === "file:") throw new Error("Open http://127.0.0.1:7890 after starting python3 web/serve.py.");
+    const result = await api("/api/status");
+    if (result.mode !== "live") throw new Error("Daemon did not return live hardware status.");
+    const { gpu, mobo, gpuMode, moboMode } = hardwareData(result.data);
+    if (!dirty) {
+      Object.assign(channels[0], { color: `#${gpu.color_hex}`, mode: gpuMode, nativeMode: gpu.mode.replaceAll("_", "-") });
+      mobo.zones.forEach((zone, i) => Object.assign(channels[i + 1], { color: `#${zone.hex}`, mode: moboMode, nativeMode: mobo.mode.replaceAll("_", "-"), speed: mobo.speed }));
     }
-  } catch (_) {
-    // Static mode fallback
+    connected = true;
+    $(".connection").dataset.state = "success";
+    $("#live-status").textContent = "● LIVE";
+    $("#daemon-status").textContent = `Daemon :${location.port || "7890"} · 2 devices detected`;
+    $("#connection-help").textContent = "GPU and motherboard verified. Changes are staged until you apply them.";
+    $("#gpu-state").textContent = "Verified";
+    $("#mobo-state").textContent = "Verified";
+    $("#firmware").textContent = mobo.firmware;
+    setControlState("success");
+  } catch (error) {
+    connected = false;
+    $(".connection").dataset.state = "error";
+    $("#live-status").textContent = "● OFFLINE";
+    $("#daemon-status").textContent = `Daemon :${location.port || "7890"} · hardware unverified`;
+    $("#connection-help").textContent = error.message;
+    $("#gpu-state").textContent = "Unverified";
+    $("#mobo-state").textContent = "Unverified";
+    $("#firmware").textContent = "unverified";
+    setControlState("error");
+  } finally {
+    refreshing = false;
+    refresh.textContent = "Refresh devices";
+    render();
   }
 }
 
-sync.addEventListener("change", () => { if (sync.checked) mirror(active); render(); });
-const animate = document.querySelector("#animate");
-if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) animate.checked = false;
-animate.addEventListener("change", () => document.body.classList.toggle("paused", !animate.checked));
-document.body.classList.toggle("paused", !animate.checked);
+apply.addEventListener("click", async () => {
+  if (!connected || busy || refreshing) return;
+  const payload = selection();
+  busy = true;
+  setControlState("loading");
+  lockControls();
+  apply.textContent = "Applying…";
+  notify("Writing lighting settings to hardware…", "loading");
+  let succeeded = false;
+  try {
+    await api("/api/apply", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    dirty = false;
+    succeeded = true;
+    notify("✓ Applied to hardware.", "success");
+    setControlState("success");
+  } catch (error) {
+    notify(`Apply failed: ${error.message} Settings remain staged; retry when ready.`, "error");
+    setControlState("error");
+  } finally {
+    busy = false;
+    apply.textContent = "Apply to hardware";
+    lockControls();
+  }
+  if (succeeded) await refreshStatus();
+});
+
+copy.addEventListener("click", async () => {
+  copy.dataset.state = "loading";
+  try {
+    await navigator.clipboard.writeText($("#command-preview").textContent);
+    copy.dataset.state = "success";
+    notify("✓ Command copied.", "success");
+  } catch {
+    copy.dataset.state = "error";
+    notify("Copy unavailable. Select the command text and copy it manually.", "error");
+  }
+});
+sync.addEventListener("change", () => {
+  if (sync.checked) for (const channel of channels) Object.assign(channel, { color: active.color, mode: active.mode, nativeMode: active.nativeMode, speed: active.speed });
+  dirty = true;
+  setControlState("default");
+  render();
+});
+refresh.addEventListener("click", refreshStatus);
+setControlState("loading");
 render();
-initLiveStatus();
+refreshStatus();
+setInterval(refreshStatus, 10000);

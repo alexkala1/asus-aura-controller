@@ -43,14 +43,15 @@ class AuraRequestHandler(http.server.SimpleHTTPRequestHandler):
                 data = json.loads(r.stdout)
                 self.send_json_response(200, {"ok": True, "mode": "live", "data": data})
             else:
-                # Fallback to dry-run status if sudo fails
-                r_dry = subprocess.run([str(CLI_BIN), "--dry-run", "--json", "status"], capture_output=True, text=True)
-                data = json.loads(r_dry.stdout) if r_dry.returncode == 0 else {}
-                self.send_json_response(200, {"ok": False, "mode": "sim", "error": r.stderr.strip(), "data": data})
+                self.send_json_response(503, {"ok": False, "error": r.stderr.strip() or "Hardware status unavailable."})
         except Exception as e:
             self.send_json_response(500, {"ok": False, "error": str(e)})
 
     def handle_post_apply(self):
+        origin = self.headers.get("Origin")
+        if origin and origin not in (f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}"):
+            self.send_json_response(403, {"ok": False, "error": "Hardware commands require the local daemon origin."})
+            return
         try:
             content_length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_length).decode("utf-8")
@@ -59,19 +60,26 @@ class AuraRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.send_json_response(400, {"ok": False, "error": f"Invalid JSON: {e}"})
             return
 
-        target = req.get("target", "all")  # all, gpu, mobo
-        is_dry_run = bool(req.get("dry_run", False))
-        is_off = bool(req.get("off", False))
-        color = req.get("color", "").lstrip("#").strip()
-        mode = req.get("mode", "static").strip()
+        if not isinstance(req, dict) or "dry_run" in req:
+            self.send_json_response(400, {"ok": False, "error": "Only live hardware commands are supported."})
+            return
+        target = req.get("target", "all")
+        is_off = req.get("off", False)
+        color = req.get("color", "")
+        mode = req.get("mode", "static")
         speed = req.get("speed", 0)
 
-        cmd = []
-        if not is_dry_run:
-            cmd.extend(["sudo", "-n"])
-        cmd.extend([str(CLI_BIN)])
-        if is_dry_run:
-            cmd.append("--dry-run")
+        if target not in ("gpu", "mobo", "all"):
+            self.send_json_response(400, {"ok": False, "error": "Unknown hardware target."})
+            return
+        if not isinstance(is_off, bool) or not isinstance(color, str) or not isinstance(mode, str) or type(speed) is not int or not 0 <= speed <= 4:
+            self.send_json_response(400, {"ok": False, "error": "Invalid lighting settings. Speed must be 0–4."})
+            return
+        color = color.removeprefix("#")
+        if not is_off and (len(color) != 6 or any(c not in "0123456789abcdefABCDEF" for c in color)):
+            self.send_json_response(400, {"ok": False, "error": "Color must contain six hexadecimal digits."})
+            return
+        cmd = ["sudo", "-n", str(CLI_BIN)]
         cmd.append(target)
 
         if is_off:
@@ -93,15 +101,13 @@ class AuraRequestHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_json_response(200, {
                     "ok": True,
                     "command": cmd_display,
-                    "output": r.stdout.strip(),
-                    "dry_run": is_dry_run
+                    "output": r.stdout.strip()
                 })
             else:
                 self.send_json_response(400, {
                     "ok": False,
                     "command": cmd_display,
-                    "error": r.stderr.strip() or r.stdout.strip(),
-                    "dry_run": is_dry_run
+                    "error": r.stderr.strip() or r.stdout.strip()
                 })
         except Exception as e:
             self.send_json_response(500, {"ok": False, "command": cmd_display, "error": str(e)})
@@ -111,17 +117,12 @@ class AuraRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(payload)
 
     def do_OPTIONS(self):
         self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
 

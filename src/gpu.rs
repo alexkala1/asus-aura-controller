@@ -2,7 +2,7 @@
 
 use std::ffi::c_ulong;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::os::fd::AsRawFd;
 
 use crate::protocol::{
@@ -122,10 +122,9 @@ impl I2cBus for DryRunI2c {
     }
 
     fn write_reg(&mut self, reg: u8, val: u8) -> io::Result<()> {
-        writeln!(
-            io::stdout().lock(),
+        crate::protocol::dry_run_log(&format!(
             "[DRY-RUN] GPU Write: Reg 0x{reg:02x} <= 0x{val:02x}"
-        )
+        ))
     }
 }
 
@@ -138,6 +137,12 @@ pub struct GpuStatus {
     pub mode: String,
     pub color_hex: String,
     pub rgb: [u8; 3],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpuSnapshot {
+    pub rgb: [u8; 3],
+    pub mode: u8,
 }
 
 pub struct GpuController<B: I2cBus> {
@@ -202,6 +207,35 @@ impl<B: I2cBus> GpuController<B> {
             (GPU_REG_GREEN, g),
             (GPU_REG_BLUE, b),
             (GPU_REG_MODE, mode.code()),
+            (GPU_REG_APPLY, 1),
+        ] {
+            self.bus.write_reg(reg, val).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Raw register snapshot, so unknown mode codes still round-trip.
+    pub fn snapshot(&mut self) -> Result<GpuSnapshot, String> {
+        self.require_signature()?;
+        let mut read = |reg| self.bus.read_reg(reg).map_err(|e| e.to_string());
+        Ok(GpuSnapshot {
+            rgb: [
+                read(GPU_REG_RED)?,
+                read(GPU_REG_GREEN)?,
+                read(GPU_REG_BLUE)?,
+            ],
+            mode: read(GPU_REG_MODE)?,
+        })
+    }
+
+    pub fn restore(&mut self, snapshot: &GpuSnapshot) -> Result<(), String> {
+        self.require_signature()?;
+        let [r, g, b] = snapshot.rgb;
+        for (reg, val) in [
+            (GPU_REG_RED, r),
+            (GPU_REG_GREEN, g),
+            (GPU_REG_BLUE, b),
+            (GPU_REG_MODE, snapshot.mode),
             (GPU_REG_APPLY, 1),
         ] {
             self.bus.write_reg(reg, val).map_err(|e| e.to_string())?;
