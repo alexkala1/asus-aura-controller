@@ -1,3 +1,4 @@
+mod gpu;
 mod protocol;
 
 fn main() {
