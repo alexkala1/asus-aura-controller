@@ -65,10 +65,20 @@ def test_lighting_dashboard(page, viewport):
         expect(page.locator(f"#{channel}-mode")).to_have_value("rainbow")
         expect(page.locator(f"#{channel}-speed")).to_have_value("2")
         assert page.locator(f"#{channel}").evaluate("el => el.style.getPropertyValue('--led')") == "#a855ff"
+    expect(page.locator("#command-preview")).to_have_text("sudo asus-aura-cli all --color a855ff --mode rainbow")
+
+    # Toggle to simulation mode and verify dry-run command
+    page.locator("#mode-sim").click()
     expect(page.locator("#command-preview")).to_have_text("asus-aura-cli --dry-run all --color a855ff --mode rainbow")
+    expect(page.locator("#btn-apply")).to_have_text("🧪 Test Dry-Run")
+
+    # Toggle back to live hardware mode
+    page.locator("#mode-live").click()
+    expect(page.locator("#command-preview")).to_have_text("sudo asus-aura-cli all --color a855ff --mode rainbow")
+    expect(page.locator("#btn-apply")).to_have_text("⚡ Apply to Hardware")
 
     page.locator("#gpu-mode").select_option("off")
-    expect(page.locator("#command-preview")).to_have_text("asus-aura-cli --dry-run all --off")
+    expect(page.locator("#command-preview")).to_have_text("sudo asus-aura-cli all --off")
     expect(page.locator(".channel-card[data-mode=off]")).to_have_count(6)
     page.locator("#sync-all").uncheck()
     set_color(page, "#gpu-color", "#ff835b")

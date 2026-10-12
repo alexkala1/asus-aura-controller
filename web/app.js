@@ -86,11 +86,43 @@ function render() {
   renderCommand();
 }
 
+let isLiveMode = true;
+const modeLiveBtn = document.querySelector("#mode-live");
+const modeSimBtn = document.querySelector("#mode-sim");
+const btnApply = document.querySelector("#btn-apply");
+const btnCopy = document.querySelector("#btn-copy");
+const toast = document.querySelector("#status-toast");
+
+function setMode(live) {
+  isLiveMode = live;
+  if (modeLiveBtn && modeSimBtn) {
+    modeLiveBtn.classList.toggle("active", live);
+    modeLiveBtn.setAttribute("aria-checked", String(live));
+    modeSimBtn.classList.toggle("active", !live);
+    modeSimBtn.setAttribute("aria-checked", String(!live));
+  }
+  if (btnApply) {
+    btnApply.textContent = live ? "⚡ Apply to Hardware" : "🧪 Test Dry-Run";
+  }
+  renderCommand();
+}
+
+if (modeLiveBtn) modeLiveBtn.addEventListener("click", () => setMode(true));
+if (modeSimBtn) modeSimBtn.addEventListener("click", () => setMode(false));
+
+function showToast(msg, type = "success") {
+  if (!toast) return;
+  toast.textContent = msg;
+  toast.className = `toast ${type}`;
+  toast.style.display = "inline-block";
+  setTimeout(() => { toast.style.display = "none"; }, 4000);
+}
+
 function renderCommand() {
   const target = sync.checked ? "all" : active.id === "gpu" ? "gpu" : "mobo";
   const mappedMode = modes.find(([key]) => key === active.mode)[2];
   const nativeMode = target === "gpu" && !gpuModes.has(mappedMode) ? "static" : mappedMode;
-  const args = ["asus-aura-cli", "--dry-run", target];
+  const args = isLiveMode ? ["sudo", "asus-aura-cli", target] : ["asus-aura-cli", "--dry-run", target];
   if (active.mode === "off") args.push("--off");
   else {
     args.push("--color", active.color.slice(1), "--mode", nativeMode);
@@ -98,11 +130,80 @@ function renderCommand() {
   }
   command.textContent = args.join(" ");
   document.querySelector("#command-target").textContent = sync.checked ? "All devices" : active.name;
-  let note = "Commands are previews only; this page never accesses hardware.";
-  if (target === "gpu" && nativeMode !== mappedMode) note = `GPU uses static color for ${active.mode}; that effect is available on the motherboard.`;
-  else if (target === "all") note = "Sync All uses the CLI's default effect speed. GPU effects without an equivalent fall back to static color.";
-  else if (target === "mobo") note = "This command affects all motherboard LEDs. Speed is ignored by static color and off commands.";
+  let note = isLiveMode
+    ? "Live Hardware Mode: Commands apply directly to your GTX 1060 and Z270E motherboard."
+    : "Simulation Mode: Previews command safely without touching hardware.";
+  if (target === "gpu" && nativeMode !== mappedMode) note += ` (GPU uses static color for ${active.mode}).`;
   document.querySelector("#command-note").textContent = note;
+}
+
+if (btnApply) {
+  btnApply.addEventListener("click", async () => {
+    const target = sync.checked ? "all" : active.id === "gpu" ? "gpu" : "mobo";
+    const mappedMode = modes.find(([key]) => key === active.mode)[2];
+    const nativeMode = target === "gpu" && !gpuModes.has(mappedMode) ? "static" : mappedMode;
+    btnApply.disabled = true;
+    btnApply.textContent = "Applying...";
+    try {
+      const resp = await fetch("/api/apply", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          target,
+          dry_run: !isLiveMode,
+          color: active.color.slice(1),
+          mode: nativeMode,
+          speed: active.speed,
+          off: active.mode === "off"
+        })
+      });
+      const data = await resp.json();
+      if (data.ok) {
+        showToast(isLiveMode ? "⚡ Applied to Hardware!" : "🧪 Dry-Run Passed!", "success");
+      } else {
+        showToast(`Error: ${data.error || "Failed to apply"}`, "error");
+      }
+    } catch (e) {
+      showToast(`Server not responding: Run 'python3 web/serve.py'`, "error");
+    } finally {
+      btnApply.disabled = false;
+      btnApply.textContent = isLiveMode ? "⚡ Apply to Hardware" : "🧪 Test Dry-Run";
+    }
+  });
+}
+
+if (btnCopy) {
+  btnCopy.addEventListener("click", () => {
+    navigator.clipboard.writeText(command.textContent).then(
+      () => showToast("📋 Command copied to clipboard!", "success"),
+      () => showToast("Failed to copy", "error")
+    );
+  });
+}
+
+// Initial fetch from live hardware status if API is available
+async function initLiveStatus() {
+  if (window.location.protocol === "file:") return;
+  try {
+    const resp = await fetch("/api/status");
+    const json = await resp.json();
+    if (json.ok && json.data) {
+      const gpu = json.data.gpu;
+      if (gpu && gpu.color_hex) {
+        channels[0].color = "#" + gpu.color_hex;
+        if (gpu.mode) channels[0].mode = gpu.mode;
+      }
+      const mobo = json.data.motherboard;
+      if (mobo && mobo.zones) {
+        mobo.zones.forEach((z, i) => {
+          if (channels[i + 1] && z.hex) channels[i + 1].color = "#" + z.hex;
+        });
+      }
+      render();
+    }
+  } catch (_) {
+    // Static mode fallback
+  }
 }
 
 sync.addEventListener("change", () => { if (sync.checked) mirror(active); render(); });
@@ -111,3 +212,4 @@ if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) animate.check
 animate.addEventListener("change", () => document.body.classList.toggle("paused", !animate.checked));
 document.body.classList.toggle("paused", !animate.checked);
 render();
+initLiveStatus();

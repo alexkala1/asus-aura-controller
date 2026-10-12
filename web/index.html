@@ -12,7 +12,14 @@
   <a class="skip-link" href="#channels">Skip to lighting controls</a>
   <header class="topbar">
     <a class="brand" href="index.html" aria-label="Aura lighting studio home"><span class="brand-mark" aria-hidden="true">A</span> AURA<span class="brand-sub">LIGHTING STUDIO</span></a>
-    <span class="simulation"><span aria-hidden="true"></span> Simulation mode</span>
+    <div class="mode-switch-group" role="radiogroup" aria-label="Operating Mode">
+      <button id="mode-live" class="mode-pill active" type="button" role="radio" aria-checked="true">
+        <span class="status-dot live" aria-hidden="true"></span> Live Hardware
+      </button>
+      <button id="mode-sim" class="mode-pill" type="button" role="radio" aria-checked="false">
+        <span class="status-dot sim" aria-hidden="true"></span> Simulation
+      </button>
+    </div>
   </header>
   <main>
     <section class="intro" aria-labelledby="page-title">
@@ -40,10 +47,15 @@
     </section>
 
     <section class="command-panel" aria-labelledby="command-title">
-      <header><div><p class="eyebrow">FROM PREVIEW TO TERMINAL</p><h2 id="command-title">CLI command</h2></div><span id="command-target">GPU channel</span></header>
-      <pre><code id="command-preview" aria-live="polite"></code></pre>
-      <p id="command-note">Commands are previews only; this page never accesses hardware.</p>
-      <p class="command-help">Zone colors are simulated independently. The CLI applies motherboard color to every onboard LED; effect modes keep the device's existing effect colors. All commands include <code>--dry-run</code>.</p>
+      <header><div><p class="eyebrow">COMMAND &amp; CONTROL</p><h2 id="command-title">Hardware Command</h2></div><span id="command-target">GPU channel</span></header>
+      <pre><code id="command-preview"></code></pre>
+      <div class="command-actions">
+        <button id="btn-apply" class="btn btn-apply" type="button">⚡ Apply to Hardware</button>
+        <button id="btn-copy" class="btn btn-secondary" type="button">📋 Copy Command</button>
+        <div id="status-toast" class="toast" role="status" aria-live="polite"></div>
+      </div>
+      <p id="command-note">Live Hardware Mode: Commands apply directly to GTX 1060 and Z270E motherboard.</p>
+      <p class="command-help">Zone colors are simulated on this dashboard. The hardware applies the selected color across onboard motherboard LEDs.</p>
     </section>
     <footer><span>AURA / LOCAL LIGHTING STUDIO</span><span>6 channels. Infinite combinations.</span></footer>
   </main>
