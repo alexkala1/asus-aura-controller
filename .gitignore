@@ -4,3 +4,7 @@
 upstream_binaries/Lighting_Control*
 upstream_binaries/extracted/Lighting_Control*
 upstream_binaries/extracted/*.cab
+__pycache__/
+*.pyc
+tests/__pycache__/
+target/
