@@ -45,9 +45,19 @@
       </section>
       <section class="device-panel mobo-panel" aria-labelledby="mobo-title">
         <header class="device-heading"><div><p class="eyebrow">02 / MOTHERBOARD</p><h2 id="mobo-title">ASUS ROG STRIX Z270E GAMING</h2><p class="hardware-address">0x02c0:0x4e · FW <span id="firmware">unverified</span></p></div><span id="mobo-state" class="device-state">Checking</span></header>
-        <div class="board-map" aria-hidden="true"><div class="io-strip"><span></span><span></span><span></span><span></span></div><div class="cpu-socket"><span>ROG<br>STRIX</span></div><div class="ram-slots"><i></i><i></i><i></i><i></i></div><div class="pci-slot"></div><div class="header-strip"></div><span class="board-caption">BACK I/O + RGB HEADER</span></div>
-        <div class="zone-heading"><h3>Onboard zones</h3><span>4 × Back I/O / 1 × Header</span></div>
-        <div id="mobo-controls" class="zone-grid"></div>
+        <div class="board-map" aria-label="Onboard LED colors">
+          <div class="zone-group"><h3>Back I/O</h3><ol class="zone-bar">
+            <li><span class="zone-led" data-zone="0"></span><span>0</span></li>
+            <li><span class="zone-led" data-zone="1"></span><span>1</span></li>
+            <li><span class="zone-led" data-zone="2"></span><span>2</span></li>
+            <li><span class="zone-led" data-zone="3"></span><span>3</span></li>
+          </ol></div>
+          <div class="zone-group header-zone"><h3>RGB Header</h3><ol class="zone-bar" start="4">
+            <li><span class="zone-led" data-zone="4"></span><span>4</span></li>
+          </ol></div>
+        </div>
+        <div id="mobo-controls"></div>
+        <p class="device-footnote">One color and effect across all five onboard LEDs.</p>
       </section>
     </section>
 

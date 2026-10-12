@@ -11,8 +11,9 @@ const modes = [
 const gpuModes = new Set(["static", "breathing", "flashing", "spectrum", "off"]);
 const channels = [
   { id: "gpu", name: "GTX 1060 logo", tag: "GPU", color: null, mode: "static", speed: 0 },
-  ...Array.from({ length: 5 }, (_, zone) => ({ id: `zone-${zone}`, name: zone < 4 ? `Back I/O · Zone ${zone}` : "RGB Header · Zone 4", tag: `0${zone}`, color: null, mode: "static", speed: 0 })),
+  { id: "mobo", name: "Motherboard lighting", tag: "5 LEDs", color: null, mode: "static", speed: 0 },
 ];
+let zoneColors = Array(5).fill(null);
 const $ = selector => document.querySelector(selector);
 let active = channels[0];
 let connected = false;
@@ -31,6 +32,7 @@ for (const channel of channels) {
   card.querySelector("h3").textContent = channel.name;
   card.querySelector(".channel-id").textContent = channel.tag;
   card.querySelector(".preview-wordmark").textContent = "GTX 1060";
+  if (channel.id === "mobo") card.querySelector(".led-preview").remove();
   for (const [selector, suffix, label] of [[".color-picker", "color", "color"], [".mode-picker", "mode", "effect"], [".speed-slider", "speed", "speed"]]) {
     const input = card.querySelector(selector);
     input.id = `${channel.id}-${suffix}`;
@@ -46,9 +48,10 @@ for (const channel of channels) {
     active = channel;
     channel[key] = value;
     // The CLI writes motherboard settings device-wide, never per zone.
-    const linked = sync.checked ? channels : channel.id === "gpu" ? [channel] : channels.slice(1);
+    const linked = sync.checked ? channels : [channel];
     for (const target of linked) {
       target[key] = value;
+      if (key === "color" && target.id === "mobo") zoneColors.fill(value);
       if (key === "mode") target.nativeMode = null;
     }
     dirty = true;
@@ -100,8 +103,16 @@ function render() {
   }
   const led = channel => channel.mode === "off" || !channel.color ? "var(--led-off)" : channel.color;
   $(".gpu-hardware").style.setProperty("--gpu-led", led(channels[0]));
-  document.querySelectorAll(".io-strip span").forEach((element, index) => element.style.setProperty("--zone-led", led(channels[index + 1])));
-  $(".header-strip").style.setProperty("--zone-led", led(channels[5]));
+  const motherboard = channels[1];
+  document.querySelectorAll(".zone-led").forEach((element, index) => {
+    const color = zoneColors[index];
+    element.style.setProperty("--zone-led", motherboard.mode === "off" || !color ? "var(--led-off)" : color);
+    element.dataset.color = color || "";
+    element.setAttribute("role", "img");
+    element.setAttribute("aria-label", `${index < 4 ? "Back I/O" : "RGB Header"} zone ${index}: ${!color ? "unverified" : motherboard.mode === "off" ? "off" : color.toUpperCase()}`);
+  });
+  $(".board-map").dataset.mode = motherboard.mode;
+  $(".board-map").style.setProperty("--duration", `${3 + motherboard.speed * 1.5}s`);
   $("#sync-state").textContent = sync.checked ? "Both devices linked" : "Control each device independently";
   markActive();
   renderCommand();
@@ -183,7 +194,8 @@ async function refreshStatus() {
     const { gpu, mobo, gpuMode, moboMode } = hardwareData(result.data);
     if (!dirty) {
       Object.assign(channels[0], { color: `#${gpu.color_hex}`, mode: gpuMode, nativeMode: gpu.mode.replaceAll("_", "-") });
-      mobo.zones.forEach((zone, i) => Object.assign(channels[i + 1], { color: `#${zone.hex}`, mode: moboMode, nativeMode: mobo.mode.replaceAll("_", "-"), speed: mobo.speed }));
+      zoneColors = mobo.zones.map(zone => `#${zone.hex}`);
+      Object.assign(channels[1], { color: zoneColors[0], mode: moboMode, nativeMode: mobo.mode.replaceAll("_", "-"), speed: mobo.speed });
     }
     connected = true;
     $(".connection").dataset.state = "success";
@@ -249,7 +261,10 @@ copy.addEventListener("click", async () => {
   }
 });
 sync.addEventListener("change", () => {
-  if (sync.checked) for (const channel of channels) Object.assign(channel, { color: active.color, mode: active.mode, nativeMode: active.nativeMode, speed: active.speed });
+  if (sync.checked) {
+    for (const channel of channels) Object.assign(channel, { color: active.color, mode: active.mode, nativeMode: active.nativeMode, speed: active.speed });
+    zoneColors.fill(active.color);
+  }
   dirty = true;
   setControlState("default");
   render();

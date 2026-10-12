@@ -97,10 +97,15 @@ def test_live_dashboard(page, daemon, width):
     expect(page.get_by_role("heading", name="NVIDIA GTX 1060 6GB")).to_be_visible()
     expect(page.get_by_role("heading", name="ASUS ROG STRIX Z270E GAMING")).to_be_visible()
     expect(page.locator("#firmware")).to_have_text("LED-0116")
-    expect(page.locator(".channel-card")).to_have_count(6)
+    expect(page.locator(".channel-card")).to_have_count(2)
+    expect(page.locator("#mobo .color-picker")).to_have_count(1)
+    expect(page.locator("#mobo .mode-picker")).to_have_count(1)
+    expect(page.locator("#mobo .speed-slider")).to_have_count(1)
+    expect(page.locator(".zone-led")).to_have_count(5)
+    expect(page.locator(".cpu-socket, .ram-slots, .pci-slot")).to_have_count(0)
     expect(page.locator("#gpu-speed")).to_be_disabled()
     expect(page.locator("#gpu-color")).to_have_value("#ff0055")
-    expect(page.locator("#zone-4-color")).to_have_value("#00e5ff")
+    expect(page.locator("#mobo-color")).to_have_value("#00e5ff")
 
     set_color(page, "#gpu-color", "#00e5ff")
     expect(page.locator("#gpu .hex-value")).to_have_text("#00E5FF")
@@ -109,16 +114,18 @@ def test_live_dashboard(page, daemon, width):
     expect(page.locator("#command-preview")).to_have_text("sudo asus-aura-cli gpu --color 00e5ff --mode breathing")
     assert daemon["writes"] == []  # Staging never writes hardware.
 
-    page.locator("#zone-0-mode").select_option("strobing")
-    page.locator("#zone-0-speed").focus()
+    set_color(page, "#mobo-color", "#112233")
+    for zone in range(5):
+        expect(page.locator(f'.zone-led[data-zone="{zone}"]')).to_have_attribute("data-color", "#112233")
+    page.locator("#mobo-mode").select_option("strobing")
+    page.locator("#mobo-speed").focus()
     page.keyboard.press("End")
     expect(page.locator("#command-preview")).to_contain_text("--mode flashing --speed 4")
-    for zone in range(5):
-        expect(page.locator(f"#zone-{zone}-mode")).to_have_value("strobing")
+    expect(page.locator(".board-map")).to_have_attribute("data-mode", "strobing")
     page.locator("#sync-all").check()
-    set_color(page, "#zone-4-color", "#ff0055")
-    page.locator("#zone-4-mode").select_option("rainbow")
-    for channel in ["gpu", *[f"zone-{i}" for i in range(5)]]:
+    set_color(page, "#mobo-color", "#ff0055")
+    page.locator("#mobo-mode").select_option("rainbow")
+    for channel in ["gpu", "mobo"]:
         expect(page.locator(f"#{channel}-color")).to_have_value("#ff0055")
         expect(page.locator(f"#{channel}-mode")).to_have_value("rainbow")
     expect(page.locator("#command-preview")).to_have_text("sudo asus-aura-cli all --color ff0055 --mode rainbow")
@@ -130,7 +137,8 @@ def test_live_dashboard(page, daemon, width):
     page.locator("#gpu-mode").select_option("off")
     expect(page.locator("#command-preview")).to_have_text("sudo asus-aura-cli all --off")
     page.locator("#btn-apply").click()
-    expect(page.locator(".channel-card[data-mode=off]")).to_have_count(6)
+    expect(page.locator(".channel-card[data-mode=off]")).to_have_count(2)
+    expect(page.locator(".board-map")).to_have_attribute("data-mode", "off")
     page.locator("#sync-all").uncheck()
     page.locator("#gpu-mode").select_option("wave")
     expect(page.locator("#command-note")).to_contain_text("GPU uses static color")
@@ -222,7 +230,7 @@ def test_preserves_native_hardware_modes(page, daemon, native):
     daemon["data"]["motherboard"]["mode"] = native
     page.goto(URL, wait_until="networkidle")
     expect(page.locator("#live-status")).to_have_text("● LIVE")
-    page.locator("#zone-0-color").focus()
+    page.locator("#mobo-color").focus()
     expect(page.locator("#command-preview")).to_contain_text(f"--mode {native.replace('_', '-')}")
 
 
@@ -256,6 +264,35 @@ def test_copy_feedback_and_hover_active_states(page, daemon):
     assert button.evaluate("el => getComputedStyle(el).boxShadow") != "none"
     page.mouse.move(0, 0)
     page.mouse.up()
+
+
+def test_connected_controls_remain_neutral_and_selection_has_no_border(page, daemon):
+    page.goto(URL, wait_until="networkidle")
+    expect(page.locator("#mobo-color")).to_have_attribute("data-state", "success")
+    assert page.locator("#mobo .controls").evaluate("el => getComputedStyle(el).boxShadow") == "none"
+    fields = page.locator("#mobo-color, #mobo-mode, #btn-apply")
+    original = fields.evaluate_all("els => els.map(el => getComputedStyle(el).borderColor)")
+    page.locator("#sync-all").check()
+    assert fields.evaluate_all("els => els.map(el => getComputedStyle(el).borderColor)") == original
+    for card in ["#gpu", "#mobo"]:
+        assert page.locator(card).evaluate("el => getComputedStyle(el).borderWidth") == "0px"
+    assert page.locator(".sync-panel").evaluate("el => getComputedStyle(el).borderLeftWidth") == "0px"
+    assert page.locator("#mobo-speed").evaluate("el => getComputedStyle(el).accentColor") != page.locator("#live-status").evaluate("el => getComputedStyle(el).color")
+    expect(page.locator("#live-status")).to_have_text("● LIVE")
+
+
+def test_board_strip_reads_each_zone_and_unified_color_writes_boardwide(page, daemon):
+    daemon["data"]["motherboard"]["zones"][4]["hex"] = "112233"
+    page.goto(URL, wait_until="networkidle")
+    expect(page.locator('.zone-led[data-zone="0"]')).to_have_attribute("data-color", "#00e5ff")
+    expect(page.locator('.zone-led[data-zone="4"]')).to_have_attribute("data-color", "#112233")
+    set_color(page, "#mobo-color", "#334455")
+    page.locator("#btn-apply").click()
+    expect(page.locator("#btn-apply")).to_be_enabled()
+    assert daemon["writes"][-1]["target"] == "mobo"
+    assert daemon["writes"][-1]["color"] == "334455"
+    for zone in range(5):
+        expect(page.locator(f'.zone-led[data-zone="{zone}"]')).to_have_attribute("data-color", "#334455")
 
 
 def test_vector_assets_and_locked_tokens():
