@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Aura • Lighting studio</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#channels">Skip to lighting controls</a>
+  <header class="topbar">
+    <a class="brand" href="index.html" aria-label="Aura lighting studio home"><span class="brand-mark" aria-hidden="true">A</span> AURA<span class="brand-sub">LIGHTING STUDIO</span></a>
+    <span class="simulation"><span aria-hidden="true"></span> Simulation mode</span>
+  </header>
+  <main>
+    <section class="intro" aria-labelledby="page-title">
+      <div><p class="eyebrow">YOUR HARDWARE. YOUR SIGNATURE.</p><h1 id="page-title">Make it <em>glow.</em></h1><p class="lede">One workspace for your ROG lighting. Dial in a color, explore an effect, and preview every LED.</p></div>
+      <div class="sync-panel">
+        <label class="switch-label" for="sync-all"><span><strong>Sync All</strong><small>One look across every channel</small></span><input id="sync-all" type="checkbox" role="switch"><span class="switch-track" aria-hidden="true"></span></label>
+        <p id="sync-state" aria-live="polite">Independent channels</p>
+      </div>
+    </section>
+
+    <div class="section-heading"><h2>Lighting channels <span>06</span></h2><label class="motion-control"><input id="animate" type="checkbox" checked> Animate previews</label></div>
+    <section id="channels" class="devices" aria-label="Device lighting controls">
+      <section class="device-panel gpu-panel" aria-labelledby="gpu-title">
+        <header class="device-heading"><div><p class="eyebrow">GRAPHICS CARD</p><h2 id="gpu-title">ROG Strix GTX 1060</h2></div><span class="device-number">01</span></header>
+        <div class="gpu-hardware" aria-hidden="true"><div class="gpu-edge"></div><div class="fans"><span class="fan"></span><span class="fan"></span><span class="fan"></span></div><span class="hardware-caption">ROG STRIX <b>GEFORCE GTX 1060</b></span></div>
+        <div id="gpu-controls"></div>
+        <p class="device-footnote">GPU Aura · 1 lighting channel</p>
+      </section>
+      <section class="device-panel mobo-panel" aria-labelledby="mobo-title">
+        <header class="device-heading"><div><p class="eyebrow">MOTHERBOARD</p><h2 id="mobo-title">ROG STRIX Z270E</h2><p class="model-detail">GAMING</p></div><span class="device-number">02</span></header>
+        <div class="board-map" aria-hidden="true"><div class="io-strip"><span></span><span></span><span></span><span></span></div><div class="cpu-socket"><span>ROG<br>STRIX</span></div><div class="ram-slots"><i></i><i></i><i></i><i></i></div><div class="pci-slot"></div><div class="header-strip"></div><span class="board-caption">BACK I/O + RGB HEADER</span></div>
+        <div class="zone-heading"><h3>Onboard zones</h3><span>4 × Back I/O / 1 × Header</span></div>
+        <div id="mobo-controls" class="zone-grid"></div>
+      </section>
+    </section>
+
+    <section class="command-panel" aria-labelledby="command-title">
+      <header><div><p class="eyebrow">FROM PREVIEW TO TERMINAL</p><h2 id="command-title">CLI command</h2></div><span id="command-target">GPU channel</span></header>
+      <pre><code id="command-preview" aria-live="polite"></code></pre>
+      <p id="command-note">Commands are previews only; this page never accesses hardware.</p>
+      <p class="command-help">Zone colors are simulated independently. The CLI applies motherboard color to every onboard LED; effect modes keep the device's existing effect colors. All commands include <code>--dry-run</code>.</p>
+    </section>
+    <footer><span>AURA / LOCAL LIGHTING STUDIO</span><span>6 channels. Infinite combinations.</span></footer>
+  </main>
+  <template id="channel-template">
+    <article class="channel-card">
+      <div class="channel-header"><h3></h3><span class="channel-id"></span></div>
+      <div class="led-preview" aria-hidden="true"><span class="led-bar"></span><span class="preview-wordmark"></span></div>
+      <div class="controls">
+        <label class="color-control"><span>Color</span><div class="color-field"><input class="color-picker" type="color"><output class="hex-value"></output></div></label>
+        <label class="mode-control"><span>Effect</span><select class="mode-picker"></select></label>
+        <label class="speed-control"><span>Speed <output class="speed-value">0</output></span><input class="speed-slider" type="range" min="0" max="4" step="1" value="0"><small>Fast <span>Slow</span></small></label>
+      </div>
+    </article>
+  </template>
+</body>
+</html>
