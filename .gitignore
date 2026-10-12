@@ -1,0 +1,6 @@
+*.zip
+*.cab
+*.msi
+upstream_binaries/Lighting_Control*
+upstream_binaries/extracted/Lighting_Control*
+upstream_binaries/extracted/*.cab
