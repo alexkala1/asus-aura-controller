@@ -497,3 +497,32 @@ fn sustained_output_backpressure_ends_the_session_with_cleanup() {
     drop(reader);
     let _ = flood.join();
 }
+
+#[test]
+fn replies_accepted_before_input_eof_are_fully_delivered() {
+    for _ in 0..5 {
+        let mut client = Client::start();
+        let id = "x".repeat(512 * 1024); // legal, below the 1 MiB inbound limit
+        client.send(json!({"jsonrpc": "2.0", "id": id, "method": "ping"}));
+        client.stdin.take(); // EOF immediately; stdout is being read normally
+        let reply = client.try_read(Duration::from_secs(10)).unwrap();
+        assert_eq!(reply["id"].as_str().map(str::len), Some(512 * 1024));
+        assert_eq!(reply["result"], json!({}));
+        let status = client.wait_exit(Duration::from_secs(5));
+        assert!(status.success());
+    }
+}
+
+#[test]
+fn many_queued_replies_drain_in_order_after_eof() {
+    let mut client = Client::start();
+    for id in 1..=60u64 {
+        client.send(json!({"jsonrpc": "2.0", "id": id, "method": "tools/list"}));
+    }
+    client.stdin.take();
+    for id in 1..=60u64 {
+        let reply = client.try_read(Duration::from_secs(10)).unwrap();
+        assert_eq!(reply["id"], id);
+    }
+    assert!(client.wait_exit(Duration::from_secs(5)).success());
+}

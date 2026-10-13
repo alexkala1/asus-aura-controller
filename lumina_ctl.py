@@ -127,21 +127,25 @@ class GpuAuraController:
         self.fd: Optional[int] = None
 
     def open(self):
-        if self.dry_run:
-            return
+        if self.dry_run or self.fd is not None:
+            return  # idempotent: an owned descriptor (and its lock) is never replaced
         if not os.path.exists(self.dev_path):
             raise FileNotFoundError(f"I2C device '{self.dev_path}' not found. Ensure i2c-dev module is loaded.")
+        import fcntl
         try:
-            import fcntl
-            self.fd = os.open(self.dev_path, os.O_RDWR)
-            try:
-                lock_device(self.fd, self.dev_path)
-                fcntl.ioctl(self.fd, I2C_SLAVE, GPU_I2C_ADDR)
-            except BaseException:
-                self.close()
-                raise
+            fd = os.open(self.dev_path, os.O_RDWR)
         except PermissionError:
             raise PermissionError(f"Permission denied accessing '{self.dev_path}'. Run with sudo or add user to group 'i2c'.")
+        try:
+            lock_device(fd, self.dev_path)
+            fcntl.ioctl(fd, I2C_SLAVE, GPU_I2C_ADDR)
+        except PermissionError:
+            os.close(fd)
+            raise PermissionError(f"Permission denied accessing '{self.dev_path}'. Run with sudo or add user to group 'i2c'.")
+        except BaseException:
+            os.close(fd)
+            raise
+        self.fd = fd  # published only once the lock and slave address are in place
 
     def close(self):
         if self.fd is not None:
@@ -259,19 +263,20 @@ class MoboAuraController:
         self.port_file: Optional[Any] = None
 
     def open(self):
-        if self.dry_run:
-            return
+        if self.dry_run or self.port_file is not None:
+            return  # idempotent: an owned file (and its lock) is never replaced
         try:
-            self.port_file = open(self.port_path, "r+b", buffering=0)
-            try:
-                lock_device(self.port_file.fileno(), self.port_path)
-            except BaseException:
-                self.close()
-                raise
+            port_file = open(self.port_path, "r+b", buffering=0)
         except PermissionError:
             raise PermissionError("Accessing /dev/port requires root privileges. Please run with sudo.")
         except FileNotFoundError:
             raise FileNotFoundError("/dev/port not found on this Linux system.")
+        try:
+            lock_device(port_file.fileno(), self.port_path)
+        except BaseException:
+            port_file.close()
+            raise
+        self.port_file = port_file
 
     def close(self):
         if self.port_file:

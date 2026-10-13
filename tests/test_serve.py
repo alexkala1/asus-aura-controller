@@ -37,6 +37,7 @@ def start(server_module):
             ("127.0.0.1", 0), server_module.LuminaRequestHandler, max_active=max_active)
         threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
         servers.append(httpd)
+        _start.last = httpd
         return httpd.server_address[1]
 
     yield _start
@@ -190,3 +191,107 @@ def test_legacy_handler_name_is_an_alias_and_logs_use_the_lumina_prefix(server_m
     handler = object.__new__(server_module.LuminaRequestHandler)
     handler.log_message("%s", "hello")
     assert capsys.readouterr().err == "[lumina-server] hello\n"
+
+
+def trickle(port, headers, body, step, interval, read_timeout=5.0):
+    """Send `body` in `step`-byte pieces, `interval` seconds apart; return (response, seconds)."""
+    started = time.monotonic()
+    with socket.create_connection(("127.0.0.1", port), timeout=read_timeout) as conn:
+        conn.sendall(post(headers))
+        try:
+            for i in range(0, len(body), step):
+                conn.sendall(body[i:i + step])
+                time.sleep(interval)
+        except OSError:
+            pass  # the server already answered and closed
+        chunks = []
+        try:
+            while chunk := conn.recv(4096):
+                chunks.append(chunk)
+        except socket.timeout:
+            pass
+    return b"".join(chunks), time.monotonic() - started
+
+
+@pytest.mark.parametrize("pad, step, interval", [
+    (0, 1, 0.02),        # tiny body, one byte at a time: short final chunk
+    (6000, 100, 0.05),   # spans several 4 KiB reads, always inside the inactivity timeout
+])
+def test_slow_progress_cannot_outlive_the_absolute_body_deadline(
+        start, server_module, monkeypatch, pad, step, interval):
+    monkeypatch.setattr(server_module, "IO_TIMEOUT", 0.3)
+    monkeypatch.setattr(server_module, "CONNECTION_DEADLINE", 10.0)
+    monkeypatch.setattr(server_module.LuminaRequestHandler, "timeout", 0.3)
+    port = start()
+    body = VALID + b" " * pad
+    response, elapsed = trickle(port, f"Content-Length: {len(body)}\r\n", body, step, interval)
+    assert status_of(response) == 408, response
+    assert elapsed < 1.5, f"deadline not enforced: {elapsed:.2f}s"
+    assert server_module.calls == [], "a late body must never reach the CLI"
+
+
+def test_a_body_that_completes_inside_the_budget_still_executes(start, server_module, monkeypatch):
+    monkeypatch.setattr(server_module, "IO_TIMEOUT", 2.0)
+    monkeypatch.setattr(server_module.LuminaRequestHandler, "timeout", 2.0)
+    port = start()
+    response, _ = trickle(port, f"Content-Length: {len(VALID)}\r\n", VALID, 20, 0.01)
+    assert status_of(response) == 200
+    assert len(server_module.calls) == 1
+
+
+def free_slots(httpd, max_active):
+    """Count admissible connections without relying on private semaphore state."""
+    taken = 0
+    while httpd._slots.acquire(blocking=False):
+        taken += 1
+    for _ in range(taken):
+        httpd._slots.release()
+    return taken
+
+
+@pytest.mark.parametrize("failures", [1, 3])
+def test_worker_start_failures_never_leak_admission_slots(start, server_module, monkeypatch, failures):
+    port = start(max_active=2)
+    httpd = start.last
+    real_start = threading.Thread.start
+    remaining = {"n": failures}
+
+    def flaky_start(self):
+        if remaining["n"] > 0 and self.name.startswith("Thread-") and "process_request" in repr(self._target):
+            remaining["n"] -= 1
+            raise RuntimeError("can't start new thread")
+        return real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", flaky_start)
+    for _ in range(failures):
+        # The server's normal error path drops the connection without a response.
+        assert exchange(port, b"GET /favicon.svg HTTP/1.1\r\nHost: x\r\n\r\n") == b""
+    assert remaining["n"] == 0
+    monkeypatch.setattr(threading.Thread, "start", real_start)
+    assert free_slots(httpd, 2) == 2, "capacity leaked"
+    ok = exchange(port, b"GET /favicon.svg HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    assert status_of(ok) == 200
+    held = [socket.create_connection(("127.0.0.1", port)) for _ in range(2)]
+    for conn in held:
+        conn.sendall(b"POST /api/apply HTTP/1.1\r\nHos")
+    time.sleep(0.2)
+    assert status_of(exchange(port, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")) == 503
+    for conn in held:
+        conn.close()
+
+
+def test_handler_exceptions_release_the_slot_exactly_once(start, server_module, monkeypatch, capfd):
+    port = start(max_active=1)
+    httpd = start.last
+
+    def boom(self):
+        raise ValueError("handler exploded")
+
+    monkeypatch.setattr(server_module.LuminaRequestHandler, "handle", boom)
+    for _ in range(3):
+        exchange(port, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+    monkeypatch.undo()
+    time.sleep(0.2)
+    assert free_slots(httpd, 1) == 1
+    assert "released too many times" not in capfd.readouterr().err
+    assert status_of(exchange(port, b"GET /favicon.svg HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")) == 200

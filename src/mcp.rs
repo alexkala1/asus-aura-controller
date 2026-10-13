@@ -1085,26 +1085,37 @@ fn read_input(mut reader: impl BufRead, tx: mpsc::SyncSender<Input>) -> io::Resu
 /// Replies go through a bounded queue to a writer thread, so a client that stops
 /// reading can block only that thread: never hold timers, signals or restoration.
 struct Output {
-    tx: mpsc::SyncSender<String>,
+    tx: Option<mpsc::SyncSender<String>>,
     failure: Arc<Mutex<Option<String>>>,
+    done: mpsc::Receiver<()>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 const OUTPUT_QUEUE: usize = 64;
+/// How long a normal end of input waits for accepted replies to reach stdout.
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Output {
     fn spawn(mut sink: impl Write + Send + 'static) -> Self {
         let (tx, rx) = mpsc::sync_channel::<String>(OUTPUT_QUEUE);
+        let (done_tx, done) = mpsc::channel();
         let failure = Arc::new(Mutex::new(None));
         let record = Arc::clone(&failure);
-        std::thread::spawn(move || {
+        let worker = std::thread::spawn(move || {
             for line in rx {
                 if let Err(e) = writeln!(sink, "{line}").and_then(|()| sink.flush()) {
                     *record.lock().unwrap() = Some(format!("stdout: {e}"));
-                    return; // dropping rx makes further sends fail immediately
+                    break; // dropping rx makes further sends fail immediately
                 }
             }
+            let _ = done_tx.send(());
         });
-        Self { tx, failure }
+        Self {
+            tx: Some(tx),
+            failure,
+            done,
+            worker: Some(worker),
+        }
     }
 
     fn failure(&self) -> Option<String> {
@@ -1115,7 +1126,10 @@ impl Output {
         if let Some(error) = self.failure() {
             return Err(error);
         }
-        match self.tx.try_send(reply.to_string()) {
+        let Some(tx) = &self.tx else {
+            return Err("stdout: output already closed".to_owned());
+        };
+        match tx.try_send(reply.to_string()) {
             Ok(()) => Ok(()),
             Err(mpsc::TrySendError::Full(_)) => {
                 Err("client is not reading responses (output backlog full)".to_owned())
@@ -1125,20 +1139,54 @@ impl Output {
                 .unwrap_or_else(|| "stdout: writer stopped".to_owned())),
         }
     }
+
+    /// Close the queue and wait (bounded) for the worker to write out every accepted
+    /// reply. The worker is joined only after it confirmed completion, so an unread
+    /// pipe can delay this by at most `timeout`, never block it forever.
+    fn finish(&mut self, timeout: Duration) -> Result<(), String> {
+        self.tx = None; // lets the worker drain what is queued, then stop
+        match self.done.recv_timeout(timeout) {
+            Ok(()) => {
+                if let Some(worker) = self.worker.take() {
+                    let _ = worker.join();
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(self.failure().unwrap_or_else(|| {
+                    format!("stdout: replies were not delivered within {timeout:?}")
+                }));
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(self
+                    .failure()
+                    .unwrap_or_else(|| "stdout: writer thread died".to_owned()));
+            }
+        }
+        self.failure().map_or(Ok(()), Err)
+    }
 }
 
-/// Main loop. Returns Ok on EOF or a shutdown signal and Err on a transport failure;
+/// Why the main loop stopped without a transport error.
+#[derive(Debug, PartialEq, Eq)]
+enum Ended {
+    /// Input closed: accepted replies are still owed to the client.
+    InputClosed,
+    /// SIGINT/SIGTERM: exit promptly, never wait on a possibly unread stdout.
+    Signal,
+}
+
+/// Main loop. Returns how it ended on EOF or a shutdown signal and Err on a transport failure;
 /// the caller runs the same cleanup either way.
 fn run_loop(
     server: &mut Server,
     rx: &mpsc::Receiver<Input>,
     out: &Output,
     stop: &AtomicBool,
-) -> Result<(), String> {
+) -> Result<Ended, String> {
     loop {
         if stop.load(Ordering::Relaxed) {
             crate::diag::log("luminactl mcp: shutdown signal received");
-            return Ok(());
+            return Ok(Ended::Signal);
         }
         if let Some(error) = out.failure() {
             return Err(error);
@@ -1152,7 +1200,7 @@ fn run_loop(
         let input = match rx.recv_timeout(wait) {
             Ok(input) => input,
             Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(RecvTimeoutError::Disconnected) => return Ok(Ended::InputClosed),
         };
         let reply = match input {
             Input::TooLarge => Some(rpc_error(&Value::Null, -32600, "message too large")),
@@ -1198,9 +1246,17 @@ pub fn serve(dry_run: bool) -> Result<(), String> {
             crate::diag::log(&format!("luminactl mcp: input error: {error}"));
         }
     });
-    let out = Output::spawn(io::stdout());
+    let mut out = Output::spawn(io::stdout());
     let outcome = run_loop(&mut server, &rx, &out, &SHUTDOWN);
+    // Hardware first: restoration never waits on the client's output.
     shutdown_cleanup(&mut server);
+    // Only a normal end of input still owes replies. After a signal or a transport
+    // failure there is nobody (or no time) to deliver them to.
+    let outcome = match outcome {
+        Ok(Ended::InputClosed) => out.finish(OUTPUT_DRAIN_TIMEOUT),
+        Ok(Ended::Signal) => Ok(()),
+        Err(error) => Err(error),
+    };
     if let Err(error) = &outcome {
         crate::diag::log(&format!("luminactl mcp: ending session: {error}"));
     } else {
@@ -1704,6 +1760,92 @@ mod tests {
             "existing baselines survive"
         );
         assert_eq!(server.hold.as_ref().unwrap().state, "working");
+    }
+
+    struct TestSink {
+        written: Arc<Mutex<Vec<u8>>>,
+        delay: Duration,
+        fail_on_flush: Option<usize>,
+        flushes: usize,
+        block: bool,
+    }
+
+    impl Write for TestSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.block {
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+            std::thread::sleep(self.delay);
+            self.written.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            if self.fail_on_flush == Some(self.flushes) {
+                return Err(io::Error::other("late sink failure"));
+            }
+            Ok(())
+        }
+    }
+
+    fn sink(
+        delay_ms: u64,
+        fail_on_flush: Option<usize>,
+        block: bool,
+    ) -> (TestSink, Arc<Mutex<Vec<u8>>>) {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let sink = TestSink {
+            written: Arc::clone(&written),
+            delay: Duration::from_millis(delay_ms),
+            fail_on_flush,
+            flushes: 0,
+            block,
+        };
+        (sink, written)
+    }
+
+    #[test]
+    fn output_finish_drains_a_slow_sink_in_order() {
+        let (slow, written) = sink(5, None, false);
+        let mut out = Output::spawn(slow);
+        for id in 0..40 {
+            out.send(&json!({"id": id})).unwrap();
+        }
+        out.finish(Duration::from_secs(5)).unwrap();
+        let text = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+        let ids: Vec<u64> = text
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<Value>(l).unwrap()["id"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(ids, (0..40).collect::<Vec<_>>());
+        assert!(text.ends_with('\n'));
+    }
+
+    #[test]
+    fn output_finish_reports_a_late_write_failure() {
+        let (failing, _written) = sink(2, Some(3), false);
+        let mut out = Output::spawn(failing);
+        for id in 0..10 {
+            let _ = out.send(&json!({"id": id})); // later sends may already fail
+        }
+        let error = out.finish(Duration::from_secs(5)).unwrap_err();
+        assert!(error.contains("late sink failure"), "{error}");
+    }
+
+    #[test]
+    fn output_finish_never_blocks_on_an_unreadable_sink() {
+        let (stuck, _written) = sink(0, None, true);
+        let mut out = Output::spawn(stuck);
+        out.send(&json!({"id": 1})).unwrap();
+        let started = Instant::now();
+        let error = out.finish(Duration::from_millis(150)).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(error.contains("not delivered"), "{error}");
     }
 
     #[test]

@@ -76,19 +76,33 @@ class LuminaRequestHandler(http.server.SimpleHTTPRequestHandler):
         length = int(raw)
         if length > MAX_BODY_BYTES:
             raise RequestError(413, f"Request body exceeds {MAX_BODY_BYTES} bytes.")
+        # One absolute budget for the whole body. Each read is limited to what is left
+        # of it, read1() returns after a single socket read, and the deadline is checked
+        # again after every read (the last one included) before anything is parsed or run.
         deadline = time.monotonic() + IO_TIMEOUT
+        connection = getattr(self, "connection", None)
+        previous_timeout = connection.gettimeout() if connection else None
         chunks, remaining = [], length
-        while remaining:
-            if time.monotonic() >= deadline:
-                raise RequestError(408, "Timed out reading the request body.")
-            try:
-                chunk = self.rfile.read(min(remaining, 4096))
-            except (socket.timeout, TimeoutError):
-                raise RequestError(408, "Timed out reading the request body.")
-            if not chunk:
-                raise RequestError(400, "Request body ended before Content-Length bytes.")
-            chunks.append(chunk)
-            remaining -= len(chunk)
+        try:
+            while remaining:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise RequestError(408, "Timed out reading the request body.")
+                if connection:
+                    connection.settimeout(left)
+                try:
+                    chunk = self.rfile.read1(min(remaining, 4096))
+                except (socket.timeout, TimeoutError):
+                    raise RequestError(408, "Timed out reading the request body.")
+                if time.monotonic() >= deadline:
+                    raise RequestError(408, "Timed out reading the request body.")
+                if not chunk:
+                    raise RequestError(400, "Request body ended before Content-Length bytes.")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+        finally:
+            if connection:
+                connection.settimeout(previous_timeout)  # restore for the response write
         try:
             return json.loads(b"".join(chunks).decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as e:
@@ -222,7 +236,13 @@ class BoundedThreadingServer(http.server.ThreadingHTTPServer):
                 pass
             self.shutdown_request(request)
             return
-        super().process_request(request, client_address)
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            # No worker exists to release the slot (e.g. Thread.start failed); do it
+            # here exactly once and let the server's normal error path close the socket.
+            self._slots.release()
+            raise
 
     def process_request_thread(self, request, client_address):
         try:

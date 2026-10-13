@@ -54,6 +54,63 @@ class TestDeviceLock(unittest.TestCase):
         self.assertIsNotNone(mobo.port_file)
         mobo.close()
 
+    @staticmethod
+    def _lock_is_free(path):
+        import fcntl
+        with open(path, "r+b") as other:
+            try:
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return False
+            return True
+
+    def test_repeated_gpu_open_keeps_one_descriptor_and_one_ioctl(self):
+        gpu = lumina_ctl.GpuAuraController(dev_path=self.tmp.name)
+        with unittest.mock.patch("fcntl.ioctl") as ioctl:
+            gpu.open()
+            first = gpu.fd
+            gpu.open()
+        self.assertEqual(gpu.fd, first)
+        ioctl.assert_called_once()
+        self.assertFalse(self._lock_is_free(self.tmp.name))
+        gpu.close()
+        self.assertTrue(self._lock_is_free(self.tmp.name))
+        with self.assertRaises(OSError):
+            os.fstat(first)  # the one descriptor was really closed
+
+    def test_public_methods_after_open_do_not_self_deadlock(self):
+        gpu = lumina_ctl.GpuAuraController(dev_path=self.tmp.name)
+        gpu.read_byte_data = unittest.mock.MagicMock(
+            side_effect=[lumina_ctl.GPU_MAGIC_HIGH, lumina_ctl.GPU_MAGIC_LOW, 1, 2, 3, 1])
+        started = time.monotonic()
+        with unittest.mock.patch.object(lumina_ctl, "DEVICE_LOCK_TIMEOUT", 0.3), \
+                unittest.mock.patch("fcntl.ioctl"):
+            gpu.open()
+            gpu.get_status()  # opens internally, then closes
+        self.assertLess(time.monotonic() - started, 0.25)
+        self.assertIsNone(gpu.fd)
+        self.assertTrue(self._lock_is_free(self.tmp.name))
+
+    def test_repeated_mobo_open_keeps_one_file_and_close_releases_the_lock(self):
+        mobo = lumina_ctl.MoboAuraController(port_path=self.tmp.name)
+        mobo.open()
+        first = mobo.port_file
+        mobo.open()
+        self.assertIs(mobo.port_file, first)
+        self.assertFalse(self._lock_is_free(self.tmp.name))
+        mobo.close()
+        self.assertTrue(first.closed)
+        self.assertTrue(self._lock_is_free(self.tmp.name))
+
+    def test_failed_second_open_never_loses_the_first_descriptor(self):
+        gpu = lumina_ctl.GpuAuraController(dev_path=self.tmp.name)
+        with unittest.mock.patch("fcntl.ioctl"):
+            gpu.open()
+            first = gpu.fd
+            gpu.open()  # no-op, so no self-contention
+        self.assertEqual(gpu.fd, first)
+        gpu.close()
+
     def test_ioctl_failure_closes_the_descriptor(self):
         gpu = lumina_ctl.GpuAuraController(dev_path=self.tmp.name)
         with unittest.mock.patch("fcntl.ioctl", side_effect=OSError(errno.EIO, "boom")):
