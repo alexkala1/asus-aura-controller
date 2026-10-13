@@ -9,6 +9,10 @@ const modes = [
   ["off", "Off", "off"],
 ];
 const gpuModes = new Set(["static", "breathing", "flashing", "spectrum", "off"]);
+// The GPU's only autonomous effect is its Spectrum color cycle: rainbow-style effects run it.
+const gpuSpectrumModes = new Set(["spectrum", "rainbow", "rainbow-breathing", "wave", "rainbow-pulse"]);
+// Effects that draw from a configured color; all others generate their own colors.
+const colorModes = new Set(["static", "breathing", "flashing", "chase-fade", "chase"]);
 const channels = [
   { id: "gpu", name: "GTX 1060 logo", tag: "GPU", color: null, mode: "static", speed: 0 },
   { id: "mobo", name: "Motherboard lighting", tag: "5 LEDs", color: null, mode: "static", speed: 0 },
@@ -125,8 +129,33 @@ function render() {
 function selection() {
   const target = sync.checked ? "all" : active.id === "gpu" ? "gpu" : "mobo";
   const mapped = active.nativeMode || modes.find(([key]) => key === active.mode)[2];
-  const mode = target === "gpu" && !gpuModes.has(mapped) ? "static" : mapped;
-  return { target, mode, color: active.color?.slice(1), speed: active.speed, off: active.mode === "off" };
+  const off = active.mode === "off";
+  // Mode name sent to the CLI. `all` takes the native name and maps each device itself;
+  // a GPU-only command must name a mode the GPU has.
+  const mode = target !== "gpu" ? mapped
+    : gpuSpectrumModes.has(mapped) ? "spectrum"
+    : gpuModes.has(mapped) ? mapped : "static";
+  // Autonomous effects (rainbow, wave, ...) never get a color flag.
+  const needsColor = target === "gpu" ? ["static", "breathing", "flashing"].includes(mode) : colorModes.has(mapped);
+  return { target, mode, mapped, color: needsColor ? active.color?.slice(1) : undefined, speed: active.speed, off };
+}
+
+function commandNote({ target, mode, mapped }) {
+  const gpuRuns = gpuSpectrumModes.has(mapped) ? "its Spectrum color cycle"
+    : gpuModes.has(mapped) ? null : "a static color";
+  const effect = active.mode;
+  if (target === "gpu") {
+    if (gpuSpectrumModes.has(mapped) && mapped !== "spectrum") return `GPU runs its Spectrum color cycle for ${effect}.`;
+    if (!gpuModes.has(mapped)) return `GPU uses static color for ${effect}; that effect is motherboard-only.`;
+    return "Applies to the GTX 1060. GPU effect speed is fixed by hardware.";
+  }
+  if (target === "mobo") return colorModes.has(mapped)
+    ? "Applies to all motherboard LEDs. Static color and off ignore speed."
+    : "Applies to all motherboard LEDs. This effect generates its own colors, so no color is sent.";
+  const own = colorModes.has(mapped) ? "" : " The effect generates its own colors, so no color is sent.";
+  return gpuRuns
+    ? `Applies to both devices. The GPU runs ${gpuRuns}.${own}`
+    : `Applies to both devices.${own}`;
 }
 
 function renderCommand() {
@@ -134,20 +163,18 @@ function renderCommand() {
     $("#command-preview").textContent = "Waiting for verified hardware…";
     return;
   }
-  const { target, mode, color, speed, off } = selection();
+  const chosen = selection();
+  const { target, mode, color, speed, off } = chosen;
   const args = ["sudo", "luminactl", target];
   if (off) args.push("--off");
   else {
-    args.push("--color", color, "--mode", mode);
+    if (color) args.push("--color", color);
+    args.push("--mode", mode);
     if (target === "mobo") args.push("--speed", speed);
   }
   $("#command-preview").textContent = args.join(" ");
   $("#command-target").textContent = sync.checked ? "Both devices" : active.name;
-  $("#command-note").textContent = target === "gpu" && mode !== modes.find(([key]) => key === active.mode)[2]
-    ? `GPU uses static color for ${active.mode}; that effect is motherboard-only.`
-    : target === "mobo" ? "Applies to all motherboard LEDs. Static color and off ignore speed."
-    : target === "all" ? "Applies to both devices. Motherboard-only effects use static color on the GPU."
-    : "Applies to the GTX 1060. GPU effect speed is fixed by hardware.";
+  $("#command-note").textContent = commandNote(chosen);
 }
 
 function notify(message, state) {
@@ -230,7 +257,7 @@ async function refreshStatus() {
 
 apply.addEventListener("click", async () => {
   if (!connected || busy || refreshing) return;
-  const payload = selection();
+  const { mapped, ...payload } = selection(); // `mapped` is display-only
   busy = true;
   setControlState("loading");
   lockControls();

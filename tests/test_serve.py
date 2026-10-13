@@ -295,3 +295,19 @@ def test_handler_exceptions_release_the_slot_exactly_once(start, server_module, 
     assert free_slots(httpd, 1) == 1
     assert "released too many times" not in capfd.readouterr().err
     assert status_of(exchange(port, b"GET /favicon.svg HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")) == 200
+
+
+def test_autonomous_modes_apply_without_a_color_but_static_still_needs_one(start, server_module):
+    port = start()
+    for mode in ("rainbow", "wave", "spectrum"):
+        body = json.dumps({"target": "all", "mode": mode, "speed": 0, "off": False}).encode()
+        response = exchange(port, post(f"Content-Length: {len(body)}\r\n", body))
+        assert status_of(response) == 200, (mode, response)
+        assert "--color" not in server_module.calls[-1]
+        assert server_module.calls[-1][-2:] == ["--mode", mode]
+    before = len(server_module.calls)
+    for body in (json.dumps({"target": "all", "mode": "static"}).encode(),
+                 json.dumps({"target": "gpu", "mode": "rainbow", "color": "zzz"}).encode()):
+        response = exchange(port, post(f"Content-Length: {len(body)}\r\n", body))
+        assert status_of(response) == 400
+    assert len(server_module.calls) == before

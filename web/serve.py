@@ -164,8 +164,12 @@ class LuminaRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.send_json_response(400, {"ok": False, "error": "Invalid lighting settings. Speed must be 0–4."})
             return
         color = color.removeprefix("#")
-        if not is_off and (len(color) != 6 or any(c not in "0123456789abcdefABCDEF" for c in color)):
+        if color and (len(color) != 6 or any(c not in "0123456789abcdefABCDEF" for c in color)):
             self.send_json_response(400, {"ok": False, "error": "Color must contain six hexadecimal digits."})
+            return
+        if not is_off and not color and mode == "static":
+            # Effects that generate their own colors need none; static always does.
+            self.send_json_response(400, {"ok": False, "error": "A color is required for static mode."})
             return
         cmd = ["sudo", "-n", str(CLI_BIN)]
         cmd.append(target)

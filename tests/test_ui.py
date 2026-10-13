@@ -32,14 +32,17 @@ def apply_status(state, payload):
     """Model CLI device-wide semantics inside the test fixture only."""
     if payload["target"] in ("all", "gpu"):
         gpu = state["data"]["gpu"]
-        gpu["mode"] = "off" if payload["off"] else payload["mode"] if payload["mode"] in ("static", "breathing", "flashing", "spectrum") else "static"
-        if not payload["off"]:
+        # GPU: its own modes, plus rainbow-style effects run its Spectrum color cycle.
+        spectrum_like = ("spectrum", "rainbow", "rainbow-breathing", "wave", "rainbow-pulse")
+        gpu["mode"] = ("off" if payload["off"] else "spectrum" if payload["mode"] in spectrum_like
+                       else payload["mode"] if payload["mode"] in ("static", "breathing", "flashing") else "static")
+        if not payload["off"] and payload.get("color"):
             gpu["color_hex"] = payload["color"]
     if payload["target"] in ("all", "mobo"):
         mobo = state["data"]["motherboard"]
         mobo["mode"] = "off" if payload["off"] else payload["mode"]
         mobo["speed"] = payload["speed"] if payload["target"] == "mobo" else 0
-        if not payload["off"] and payload["mode"] == "static":
+        if not payload["off"] and payload["mode"] == "static" and payload.get("color"):
             for zone in mobo["zones"]:
                 zone["hex"] = payload["color"]
 
@@ -128,11 +131,17 @@ def test_live_dashboard(page, daemon, width):
     for channel in ["gpu", "mobo"]:
         expect(page.locator(f"#{channel}-color")).to_have_value("#ff0055")
         expect(page.locator(f"#{channel}-mode")).to_have_value("rainbow")
-    expect(page.locator("#command-preview")).to_have_text("sudo luminactl all --color ff0055 --mode rainbow")
+    # Rainbow generates its own colors: no color flag, and the GPU runs its Spectrum cycle.
+    expect(page.locator("#command-preview")).to_have_text("sudo luminactl all --mode rainbow")
+    expect(page.locator("#command-note")).to_contain_text("The GPU runs its Spectrum color cycle")
+    expect(page.locator("#command-note")).not_to_contain_text("static")
     page.locator("#btn-apply").click()
     expect(page.locator("#status-toast")).to_have_text("✓ Applied to hardware.")
     expect(page.locator("#btn-apply")).to_be_enabled()
-    assert daemon["writes"] == [{"target": "all", "mode": "rainbow", "color": "ff0055", "speed": 4, "off": False}]
+    assert daemon["writes"] == [{"target": "all", "mode": "rainbow", "speed": 4, "off": False}]
+    assert daemon["data"]["gpu"]["mode"] == "spectrum"
+    assert daemon["data"]["motherboard"]["mode"] == "rainbow"
+    expect(page.locator("#gpu-mode")).to_have_value("color-cycle")  # read back from hardware
 
     page.locator("#gpu-mode").select_option("off")
     expect(page.locator("#command-preview")).to_have_text("sudo luminactl all --off")
@@ -141,6 +150,8 @@ def test_live_dashboard(page, daemon, width):
     expect(page.locator(".board-map")).to_have_attribute("data-mode", "off")
     page.locator("#sync-all").uncheck()
     page.locator("#gpu-mode").select_option("wave")
+    expect(page.locator("#command-note")).to_contain_text("GPU runs its Spectrum color cycle for wave")
+    page.locator("#gpu-mode").select_option("starry-night")  # no GPU equivalent at all
     expect(page.locator("#command-note")).to_contain_text("GPU uses static color")
 
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
@@ -298,6 +309,36 @@ def test_linked_edits_stage_both_devices_and_apply_clears_both(page, daemon):
     page.locator("#btn-apply").click()
     expect(page.locator("#status-toast")).to_have_text("✓ Applied to hardware.")
     assert [w["target"] for w in daemon["writes"]] == ["all"]
+
+
+@pytest.mark.parametrize("mode, gpu_note", [
+    ("rainbow", "Spectrum color cycle"), ("wave", "Spectrum color cycle"),
+    ("glowing-yoyo", "Spectrum color cycle"), ("color-cycle", "Spectrum color cycle"),
+    ("starry-night", "Applies to both devices."),
+])
+def test_autonomous_modes_omit_color_and_map_gpu_spectrum(page, daemon, mode, gpu_note):
+    page.goto(URL, wait_until="networkidle")
+    page.locator("#sync-all").check()
+    set_color(page, "#gpu-color", "#ff0055")
+    page.locator("#gpu-mode").select_option(mode)
+    native = {"glowing-yoyo": "rainbow-pulse", "color-cycle": "spectrum", "starry-night": "random-flicker"}.get(mode, mode)
+    expect(page.locator("#command-preview")).to_have_text(f"sudo luminactl all --mode {native}")
+    expect(page.locator("#command-note")).to_contain_text(gpu_note)
+    expect(page.locator("#command-preview")).not_to_contain_text("--color")
+
+
+def test_gpu_only_rainbow_names_the_spectrum_mode_and_sends_no_color(page, daemon):
+    page.goto(URL, wait_until="networkidle")
+    set_color(page, "#gpu-color", "#ff0055")
+    page.locator("#gpu-mode").select_option("rainbow")
+    expect(page.locator("#command-preview")).to_have_text("sudo luminactl gpu --mode spectrum")
+    expect(page.locator("#command-note")).to_contain_text("GPU runs its Spectrum color cycle for rainbow")
+    page.locator("#btn-apply").click()
+    expect(page.locator("#status-toast")).to_have_text("✓ Applied to hardware.")
+    assert daemon["writes"] == [{"target": "gpu", "mode": "spectrum", "speed": 0, "off": False}]
+    # Color-driven effects still carry their color.
+    page.locator("#gpu-mode").select_option("breathing")
+    expect(page.locator("#command-preview")).to_have_text("sudo luminactl gpu --color ff0055 --mode breathing")
 
 
 def test_copy_feedback_and_hover_active_states(page, daemon):
