@@ -181,3 +181,61 @@ fn dry_run_needs_no_writable_runtime_directory() {
         assert!(!dir.exists());
     }
 }
+
+fn mobo_writes(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("[DRY-RUN] Mobo Write: Reg "))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn all_color_effects_write_the_effect_buffer_and_leave_direct_mode() {
+    for (mode, code) in [("breathing", "0x02"), ("flashing", "0x03")] {
+        let stdout = successful_stdout(&["all", "--color", "112233", "--mode", mode]);
+        let mut expected = vec!["0x8020 <= 0x00".to_owned()];
+        for led in 0..5u16 {
+            for (offset, byte) in ["0x11", "0x33", "0x22"].iter().enumerate() {
+                expected.push(format!(
+                    "0x{:04x} <= {byte}",
+                    0x8010 + 3 * led + offset as u16
+                ));
+            }
+        }
+        expected.extend(
+            [
+                "0x8021 <= ",
+                "0x8022 <= 0x00",
+                "0x8023 <= 0x00",
+                "0x80a0 <= 0x01",
+            ]
+            .map(|s| {
+                if s.ends_with("<= ") {
+                    format!("{s}{code}")
+                } else {
+                    s.to_owned()
+                }
+            }),
+        );
+        assert_eq!(mobo_writes(&stdout), expected, "{mode}");
+        assert!(stdout.contains("Synchronized GPU and Motherboard to #112233"));
+    }
+}
+
+#[test]
+fn all_autonomous_effects_leave_direct_mode_and_do_not_claim_the_color() {
+    let stdout = successful_stdout(&["all", "--color", "112233", "--mode", "rainbow"]);
+    assert_eq!(
+        mobo_writes(&stdout),
+        [
+            "0x8020 <= 0x00",
+            "0x8021 <= 0x05",
+            "0x8022 <= 0x00",
+            "0x8023 <= 0x00",
+            "0x80a0 <= 0x01"
+        ]
+    );
+    assert!(stdout.contains("generates its own colors"));
+    assert!(!stdout.contains("Synchronized"));
+}

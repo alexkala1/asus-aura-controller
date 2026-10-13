@@ -15,6 +15,30 @@ import argparse
 import json
 from typing import Dict, Any, Tuple, Optional, List
 
+# Matches the Rust CLI: one exclusive advisory flock per device node, held while open,
+# so Python and Rust processes never interleave register transactions.
+DEVICE_LOCK_TIMEOUT = 5.0
+
+
+def lock_device(fd: int, path: str, timeout: Optional[float] = None,
+                sleep=time.sleep, monotonic=time.monotonic) -> None:
+    import errno
+    import fcntl
+    deadline = monotonic() + (DEVICE_LOCK_TIMEOUT if timeout is None else timeout)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError as exc:
+            if exc.errno not in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+                raise
+            if monotonic() >= deadline:
+                raise TimeoutError(
+                    f"timed out waiting for exclusive access to {path} "
+                    "(another asus-aura process is using it)")
+            sleep(0.025)
+
+
 # --- Constants: GPU ---
 GPU_I2C_DEV = "/dev/i2c-0"
 GPU_I2C_ADDR = 0x29
@@ -110,7 +134,12 @@ class GpuAuraController:
         try:
             import fcntl
             self.fd = os.open(self.dev_path, os.O_RDWR)
-            fcntl.ioctl(self.fd, I2C_SLAVE, GPU_I2C_ADDR)
+            try:
+                lock_device(self.fd, self.dev_path)
+                fcntl.ioctl(self.fd, I2C_SLAVE, GPU_I2C_ADDR)
+            except BaseException:
+                self.close()
+                raise
         except PermissionError:
             raise PermissionError(f"Permission denied accessing '{self.dev_path}'. Run with sudo or add user to group 'i2c'.")
 
@@ -222,16 +251,23 @@ class GpuAuraController:
 class MoboAuraController:
     """Controls the ASUS ROG STRIX Z270E GAMING Aura controller via NCT6793D Super I/O SMBus."""
 
-    def __init__(self, base_port: int = MOBO_PORT_BASE, dry_run: bool = False):
+    def __init__(self, base_port: int = MOBO_PORT_BASE, dry_run: bool = False,
+                 port_path: str = "/dev/port"):
         self.base_port = base_port
         self.dry_run = dry_run
+        self.port_path = port_path
         self.port_file: Optional[Any] = None
 
     def open(self):
         if self.dry_run:
             return
         try:
-            self.port_file = open("/dev/port", "r+b", buffering=0)
+            self.port_file = open(self.port_path, "r+b", buffering=0)
+            try:
+                lock_device(self.port_file.fileno(), self.port_path)
+            except BaseException:
+                self.close()
+                raise
         except PermissionError:
             raise PermissionError("Accessing /dev/port requires root privileges. Please run with sudo.")
         except FileNotFoundError:
@@ -332,6 +368,8 @@ class MoboAuraController:
         try:
             fw_name = self.verify()
             led_count = self.ene_read_reg(MOBO_REG_CONFIG + 0x02) if not self.dry_run else 5
+            if led_count > 5:
+                raise RuntimeError(f"Motherboard reports {led_count} LEDs but the color buffers hold 5. Safety abort.")
             mode_val = self.ene_read_reg(MOBO_REG_MODE) if not self.dry_run else 5
             speed_val = self.ene_read_reg(MOBO_REG_SPEED) if not self.dry_run else 0
             dir_val = self.ene_read_reg(MOBO_REG_DIRECTION) if not self.dry_run else 0

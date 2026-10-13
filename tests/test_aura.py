@@ -1,6 +1,73 @@
+import errno
+import os
+import subprocess
+import sys
+import tempfile
+import time
 import unittest
+import unittest.mock
 from unittest.mock import MagicMock, patch
 import aura_ctl
+
+def _hold_lock(path):
+    """Hold the Rust-compatible exclusive flock from a separate process."""
+    code = ("import fcntl,sys,time;f=open(sys.argv[1],'r+b');"
+            "fcntl.flock(f,fcntl.LOCK_EX);print('locked',flush=True);sys.stdin.readline()")
+    proc = subprocess.Popen([sys.executable, "-I", "-c", code, path], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, text=True)
+    assert proc.stdout.readline().strip() == "locked"
+    return proc
+
+
+class TestDeviceLock(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile()
+        self.addCleanup(self.tmp.close)
+
+    def test_gpu_open_blocks_ioctl_while_another_process_holds_the_lock(self):
+        holder = _hold_lock(self.tmp.name)
+        self.addCleanup(holder.kill)
+        gpu = aura_ctl.GpuAuraController(dev_path=self.tmp.name)
+        with unittest.mock.patch.object(aura_ctl, "DEVICE_LOCK_TIMEOUT", 0.15), \
+                unittest.mock.patch("fcntl.ioctl") as ioctl:
+            with self.assertRaises(TimeoutError) as ctx:
+                gpu.open()
+        ioctl.assert_not_called()
+        self.assertIn(self.tmp.name, str(ctx.exception))
+        self.assertIsNone(gpu.fd)  # descriptor closed on failure
+        holder.stdin.write("\n"); holder.stdin.close(); holder.stdout.close(); holder.wait(5)
+        with unittest.mock.patch("fcntl.ioctl") as ioctl:
+            gpu.open()
+        ioctl.assert_called_once()
+        gpu.close()
+
+    def test_mobo_open_waits_then_proceeds_after_release(self):
+        holder = _hold_lock(self.tmp.name)
+        self.addCleanup(holder.kill)
+        mobo = aura_ctl.MoboAuraController(port_path=self.tmp.name)
+        with unittest.mock.patch.object(aura_ctl, "DEVICE_LOCK_TIMEOUT", 0.15):
+            with self.assertRaises(TimeoutError):
+                mobo.open()
+        self.assertIsNone(mobo.port_file)
+        holder.stdin.write("\n"); holder.stdin.close(); holder.stdout.close(); holder.wait(5)
+        mobo.open()
+        self.assertIsNotNone(mobo.port_file)
+        mobo.close()
+
+    def test_ioctl_failure_closes_the_descriptor(self):
+        gpu = aura_ctl.GpuAuraController(dev_path=self.tmp.name)
+        with unittest.mock.patch("fcntl.ioctl", side_effect=OSError(errno.EIO, "boom")):
+            with self.assertRaises(OSError):
+                gpu.open()
+        self.assertIsNone(gpu.fd)
+
+    def test_dry_run_never_touches_device_files(self):
+        missing = os.path.join(tempfile.gettempdir(), "aura-no-such-device")
+        gpu = aura_ctl.GpuAuraController(dev_path=missing, dry_run=True)
+        mobo = aura_ctl.MoboAuraController(dry_run=True, port_path=missing)
+        gpu.open(); mobo.open()
+        self.assertFalse(os.path.exists(missing))
+
 
 class TestAuraController(unittest.TestCase):
 

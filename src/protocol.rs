@@ -6,13 +6,15 @@ static DRY_RUN_LOG_TO_STDERR: AtomicBool = AtomicBool::new(false);
 
 /// MCP owns stdout for JSON-RPC, so dry-run write traces must move to stderr.
 pub fn route_dry_run_log_to_stderr() {
+    crate::diag::init();
     DRY_RUN_LOG_TO_STDERR.store(true, Ordering::Relaxed);
 }
 
 pub fn dry_run_log(line: &str) -> std::io::Result<()> {
     use std::io::Write;
     if DRY_RUN_LOG_TO_STDERR.load(Ordering::Relaxed) {
-        writeln!(std::io::stderr().lock(), "{line}")
+        crate::diag::log(line);
+        Ok(())
     } else {
         writeln!(std::io::stdout().lock(), "{line}")
     }
@@ -122,6 +124,14 @@ impl MoboMode {
             13 => Some(Self::RandomFlicker),
             _ => None,
         }
+    }
+
+    /// Whether the effect draws from the configured color buffer (REA mode table).
+    pub fn uses_color(self) -> bool {
+        matches!(
+            self,
+            Self::Static | Self::Breathing | Self::Flashing | Self::ChaseFade | Self::Chase
+        )
     }
 
     pub fn name(self) -> &'static str {

@@ -5,6 +5,7 @@
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
@@ -298,16 +299,52 @@ fn agent_pattern(state: &str) -> Option<Pattern> {
     })
 }
 
-struct Baseline {
-    gpu: Option<GpuSnapshot>,
-    mobo: Option<MoboSnapshot>,
+const MAX_RESTORE_ATTEMPTS: u8 = 3;
+const RESTORE_RETRY: Duration = Duration::from_secs(5);
+
+/// A saved baseline for one device. Devices are tracked separately so an explicit
+/// change, a failed restore or a missing snapshot on one never affects the other.
+struct DeviceHold<S> {
+    snapshot: S,
+    attempts: u8,
 }
 
 struct AgentHold {
     state: String,
-    baseline: Baseline,
     deadline: Instant,
-    restore_attempts: u8,
+    gpu: Option<DeviceHold<GpuSnapshot>>,
+    mobo: Option<DeviceHold<MoboSnapshot>>,
+}
+
+impl AgentHold {
+    fn is_empty(&self) -> bool {
+        self.gpu.is_none() && self.mobo.is_none()
+    }
+
+    fn attempts(&self) -> u8 {
+        let gpu = self.gpu.as_ref().map_or(0, |h| h.attempts);
+        let mobo = self.mobo.as_ref().map_or(0, |h| h.attempts);
+        gpu.max(mobo)
+    }
+
+    fn enrolled(&self) -> Vec<&'static str> {
+        let mut devices = Vec::new();
+        if self.gpu.is_some() {
+            devices.push("gpu");
+        }
+        if self.mobo.is_some() {
+            devices.push("motherboard");
+        }
+        devices
+    }
+}
+
+/// Outcome of one restore pass, per device.
+#[derive(Default)]
+struct RestoreReport {
+    restored: Vec<&'static str>,
+    not_enrolled: Vec<&'static str>,
+    failed: Vec<String>,
 }
 
 // ---------------------------------------------------------------- arguments
@@ -461,8 +498,11 @@ fn topology() -> Value {
 pub struct Server {
     dry_run: bool,
     hold: Option<AgentHold>,
+    /// Test-only fault injection: (operation, device) pairs that must fail.
     #[cfg(test)]
-    fail_restore: bool,
+    faults: Vec<(&'static str, &'static str)>,
+    #[cfg(test)]
+    restore_calls: Vec<&'static str>,
 }
 
 fn rpc_error(id: &Value, code: i32, message: impl Into<String>) -> Value {
@@ -480,8 +520,36 @@ impl Server {
             dry_run,
             hold: None,
             #[cfg(test)]
-            fail_restore: false,
+            faults: Vec::new(),
+            #[cfg(test)]
+            restore_calls: Vec::new(),
         }
+    }
+
+    #[cfg(test)]
+    fn fault(&self, operation: &str, device: &str) -> bool {
+        self.faults
+            .iter()
+            .any(|(o, d)| *o == operation && *d == device)
+    }
+
+    #[cfg(not(test))]
+    fn fault(&self, _operation: &str, _device: &str) -> bool {
+        false
+    }
+
+    fn open_gpu(&self) -> Result<Gpu, String> {
+        if self.fault("open", "gpu") {
+            return Err("injected open failure".to_owned());
+        }
+        gpu_controller(self.dry_run)
+    }
+
+    fn open_mobo(&self) -> Result<Mobo, String> {
+        if self.fault("open", "motherboard") {
+            return Err("injected open failure".to_owned());
+        }
+        mobo_controller(self.dry_run)
     }
 
     /// One inbound line to at most one outbound message (notifications get none).
@@ -629,13 +697,17 @@ impl Server {
 
     fn hold_status(&self) -> Value {
         let now = Instant::now();
-        self.hold.as_ref().map(|h| {
-            json!({
-                "state": if h.restore_attempts > 0 { "restoring" } else { &h.state },
-                "restore_attempts": h.restore_attempts,
-                "reverts_in_seconds": h.deadline.saturating_duration_since(now).as_secs_f32().ceil()
+        self.hold
+            .as_ref()
+            .map(|h| {
+                json!({
+                    "state": if h.attempts() > 0 { "restoring" } else { &h.state },
+                    "restore_attempts": h.attempts(),
+                    "baseline_devices": h.enrolled(),
+                    "reverts_in_seconds": h.deadline.saturating_duration_since(now).as_secs_f32().ceil()
+                })
             })
-        }).unwrap_or(Value::Null)
+            .unwrap_or(Value::Null)
     }
 
     fn set_color(&mut self, args: &Map<String, Value>) -> Result<(Value, bool), String> {
@@ -670,22 +742,30 @@ impl Server {
         self.apply_user_plan(&plan)
     }
 
-    /// Explicit lighting changes supersede any agent-state hold (nothing left to restore).
+    /// An explicit change relinquishes the saved baseline of exactly the devices it
+    /// changed. Devices it did not touch, or failed to change, keep theirs.
     fn apply_user_plan(&mut self, plan: &Plan) -> Result<(Value, bool), String> {
         // Open every requested device first so a missing one aborts before any write.
-        let mut gpu = plan
-            .gpu
-            .as_ref()
-            .map(|_| gpu_controller(self.dry_run))
-            .transpose()?;
-        let mut mobo = plan
-            .mobo
-            .as_ref()
-            .map(|_| mobo_controller(self.dry_run))
-            .transpose()?;
-        let (body, ok) = run_plan(plan, gpu.as_mut(), mobo.as_mut());
-        if ok {
-            self.hold = None;
+        let mut gpu = plan.gpu.as_ref().map(|_| self.open_gpu()).transpose()?;
+        let mut mobo = plan.mobo.as_ref().map(|_| self.open_mobo()).transpose()?;
+        let (mut body, ok) = run_plan(plan, gpu.as_mut(), mobo.as_mut(), &|d| {
+            self.fault("apply", d)
+        });
+        let applied = body["applied"].clone();
+        let mut released = Vec::new();
+        if let Some(hold) = self.hold.as_mut() {
+            if applied.get("gpu").is_some() && hold.gpu.take().is_some() {
+                released.push("gpu");
+            }
+            if applied.get("motherboard").is_some() && hold.mobo.take().is_some() {
+                released.push("motherboard");
+            }
+            if hold.is_empty() {
+                self.hold = None;
+            }
+        }
+        if !released.is_empty() {
+            body["agent_hold_released"] = json!(released);
         }
         Ok((body, !ok))
     }
@@ -695,106 +775,189 @@ impl Server {
         let state = arg_str(args, "state")?.ok_or("`state` is required")?;
         let seconds = arg_uint(args, "duration_seconds", 1, MAX_HOLD_SECONDS)?;
         if state == "idle" {
-            let restored = self.restore_baseline()?;
-            return Ok((
-                json!({"state_applied": "idle", "pattern": "baseline", "baseline_restored": restored}),
-                false,
-            ));
+            let report = self.restore_baseline();
+            let ok = report.failed.is_empty();
+            let mut body = json!({
+                "state_applied": "idle",
+                "pattern": "baseline",
+                "baseline_restored": !report.restored.is_empty(),
+                "restored_devices": report.restored,
+                "not_enrolled": report.not_enrolled,
+            });
+            if !ok {
+                body["success"] = json!(false);
+                body["error"] = json!(format!(
+                    "Baseline restore failed ({}); the remaining baselines are kept and retried",
+                    report.failed.join("; ")
+                ));
+            }
+            return Ok((body, !ok));
         }
         let pattern = agent_pattern(state).ok_or_else(|| {
             format!("Unknown state '{state}' (working, reviewing, success, failure, idle)")
         })?;
         let mut warnings = Vec::new();
-        let mut gpu = gpu_controller(self.dry_run)
+        let mut gpu = self
+            .open_gpu()
             .map_err(|e| warnings.push(format!("gpu unavailable: {e}")))
             .ok();
-        let mut mobo = mobo_controller(self.dry_run)
+        let mut mobo = self
+            .open_mobo()
             .map_err(|e| warnings.push(format!("motherboard unavailable: {e}")))
             .ok();
-        if gpu.is_none() && mobo.is_none() {
-            return Err(warnings.join("; "));
-        }
-        // Keep the earliest baseline across chained states (working -> success -> idle).
-        let baseline = match self.hold.take() {
-            Some(hold) => hold.baseline,
-            None => Baseline {
-                gpu: gpu.as_mut().and_then(|c| {
-                    c.snapshot()
-                        .map_err(|e| warnings.push(format!("gpu baseline not saved: {e}")))
-                        .ok()
-                }),
-                mobo: mobo.as_mut().and_then(|c| {
-                    c.snapshot()
-                        .map_err(|e| warnings.push(format!("motherboard baseline not saved: {e}")))
-                        .ok()
-                }),
-            },
-        };
-        let hold_for = Duration::from_secs(seconds.unwrap_or(pattern.default_seconds));
-        self.hold = Some(AgentHold {
+        let mut hold = self.hold.take().unwrap_or(AgentHold {
             state: state.to_owned(),
-            baseline,
-            deadline: Instant::now() + hold_for,
-            restore_attempts: 0,
+            deadline: Instant::now(),
+            gpu: None,
+            mobo: None,
         });
-        let (mut body, ok) = run_plan(&pattern.plan, gpu.as_mut(), mobo.as_mut());
+        // A device only joins the pattern once its baseline is safely saved; chained
+        // states keep the earliest baseline and enrol newly available devices.
+        if hold.gpu.is_none() {
+            if let Some(controller) = gpu.as_mut() {
+                let saved = if self.fault("snapshot", "gpu") {
+                    Err("injected snapshot failure".to_owned())
+                } else {
+                    controller.snapshot()
+                };
+                match saved {
+                    Ok(snapshot) => {
+                        hold.gpu = Some(DeviceHold {
+                            snapshot,
+                            attempts: 0,
+                        })
+                    }
+                    Err(e) => {
+                        warnings.push(format!("gpu excluded: baseline not saved: {e}"));
+                        gpu = None;
+                    }
+                }
+            }
+        }
+        if hold.mobo.is_none() {
+            if let Some(controller) = mobo.as_mut() {
+                let saved = if self.fault("snapshot", "motherboard") {
+                    Err("injected snapshot failure".to_owned())
+                } else {
+                    controller.snapshot()
+                };
+                match saved {
+                    Ok(snapshot) => {
+                        hold.mobo = Some(DeviceHold {
+                            snapshot,
+                            attempts: 0,
+                        })
+                    }
+                    Err(e) => {
+                        warnings.push(format!("motherboard excluded: baseline not saved: {e}"));
+                        mobo = None;
+                    }
+                }
+            }
+        }
+        if gpu.is_none() && mobo.is_none() {
+            if !hold.is_empty() {
+                self.hold = Some(hold);
+            }
+            return Err(format!(
+                "No device with a recoverable baseline: {}",
+                warnings.join("; ")
+            ));
+        }
+        let hold_for = Duration::from_secs(seconds.unwrap_or(pattern.default_seconds));
+        hold.state = state.to_owned();
+        hold.deadline = Instant::now() + hold_for;
+        if gpu.is_some() {
+            if let Some(h) = hold.gpu.as_mut() {
+                h.attempts = 0;
+            }
+        }
+        if mobo.is_some() {
+            if let Some(h) = hold.mobo.as_mut() {
+                h.attempts = 0;
+            }
+        }
+        let enrolled = hold.enrolled();
+        self.hold = Some(hold);
+        let (mut body, ok) = run_plan(&pattern.plan, gpu.as_mut(), mobo.as_mut(), &|d| {
+            self.fault("apply", d)
+        });
         body["state_applied"] = json!(state);
         body["pattern"] = json!(pattern.name);
         body["reverts_in_seconds"] = json!(hold_for.as_secs());
+        body["baseline_devices"] = json!(enrolled);
         if !warnings.is_empty() {
             body["warnings"] = json!(warnings);
         }
         Ok((body, !ok))
     }
 
-    /// Returns whether anything was restored; errors from the hardware are surfaced.
-    fn restore_baseline(&mut self) -> Result<bool, String> {
-        if self.hold.is_none() {
-            return Ok(false);
+    /// Restore each enrolled device independently. A device that restores is released
+    /// and never rewritten; one that fails keeps its baseline for a bounded retry.
+    fn restore_baseline(&mut self) -> RestoreReport {
+        let mut report = RestoreReport::default();
+        let Some(mut hold) = self.hold.take() else {
+            return report;
+        };
+        if hold.gpu.is_none() {
+            report.not_enrolled.push("gpu");
         }
-        let result = self.write_baseline();
-        match result {
-            Ok(()) => {
-                self.hold = None;
-                Ok(true)
-            }
-            Err(error) => {
-                let hold = self.hold.as_mut().unwrap();
-                hold.restore_attempts += 1;
-                hold.deadline = Instant::now() + Duration::from_secs(5);
-                if hold.restore_attempts >= 3 {
-                    self.hold = None;
-                    eprintln!(
-                        "asus-aura mcp: giving up baseline restore after 3 attempts: {error}"
-                    );
+        if hold.mobo.is_none() {
+            report.not_enrolled.push("motherboard");
+        }
+        if let Some(mut device) = hold.gpu.take() {
+            #[cfg(test)]
+            self.restore_calls.push("gpu");
+            let result = if self.fault("restore", "gpu") {
+                Err("injected restore failure".to_owned())
+            } else {
+                self.open_gpu()
+                    .and_then(|mut c| c.restore(&device.snapshot))
+            };
+            match result {
+                Ok(()) => report.restored.push("gpu"),
+                Err(e) => {
+                    device.attempts += 1;
+                    report.failed.push(format!("gpu: {e}"));
+                    if device.attempts < MAX_RESTORE_ATTEMPTS {
+                        hold.gpu = Some(device);
+                    } else {
+                        crate::diag::log(&format!(
+                            "asus-aura mcp: giving up gpu baseline restore after {MAX_RESTORE_ATTEMPTS} attempts: {e}"
+                        ));
+                    }
                 }
-                Err(error)
             }
         }
-    }
-
-    fn write_baseline(&self) -> Result<(), String> {
-        #[cfg(test)]
-        if self.fail_restore {
-            return Err("injected restore failure".to_owned());
-        }
-        let hold = self.hold.as_ref().unwrap();
-        let mut errors = Vec::new();
-        if let Some(snapshot) = &hold.baseline.gpu {
-            if let Err(e) = gpu_controller(self.dry_run).and_then(|mut c| c.restore(snapshot)) {
-                errors.push(format!("gpu: {e}"));
+        if let Some(mut device) = hold.mobo.take() {
+            #[cfg(test)]
+            self.restore_calls.push("motherboard");
+            let result = if self.fault("restore", "motherboard") {
+                Err("injected restore failure".to_owned())
+            } else {
+                self.open_mobo()
+                    .and_then(|mut c| c.restore(&device.snapshot))
+            };
+            match result {
+                Ok(()) => report.restored.push("motherboard"),
+                Err(e) => {
+                    device.attempts += 1;
+                    report.failed.push(format!("motherboard: {e}"));
+                    if device.attempts < MAX_RESTORE_ATTEMPTS {
+                        hold.mobo = Some(device);
+                    } else {
+                        crate::diag::log(&format!(
+                            "asus-aura mcp: giving up motherboard baseline restore after {MAX_RESTORE_ATTEMPTS} attempts: {e}"
+                        ));
+                    }
+                }
             }
         }
-        if let Some(snapshot) = &hold.baseline.mobo {
-            if let Err(e) = mobo_controller(self.dry_run).and_then(|mut c| c.restore(snapshot)) {
-                errors.push(format!("motherboard: {e}"));
-            }
+        if !hold.is_empty() {
+            hold.deadline = Instant::now() + RESTORE_RETRY;
+            self.hold = Some(hold);
         }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(format!("Baseline restore failed ({})", errors.join("; ")))
-        }
+        report
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
@@ -804,25 +967,42 @@ impl Server {
     /// Timer path: revert once the hold has expired.
     pub fn expire_if_due(&mut self, now: Instant) {
         if self.hold.as_ref().is_some_and(|h| h.deadline <= now) {
-            if let Err(e) = self.restore_baseline() {
-                eprintln!("asus-aura mcp: {e}");
+            for failure in self.restore_baseline().failed {
+                crate::diag::log(&format!(
+                    "asus-aura mcp: baseline restore failed: {failure}"
+                ));
             }
         }
     }
 }
 
 /// Apply each side independently and report exactly what happened per device.
-fn run_plan(plan: &Plan, gpu: Option<&mut Gpu>, mobo: Option<&mut Mobo>) -> (Value, bool) {
+fn run_plan(
+    plan: &Plan,
+    gpu: Option<&mut Gpu>,
+    mobo: Option<&mut Mobo>,
+    inject_failure: &dyn Fn(&str) -> bool,
+) -> (Value, bool) {
     let mut applied = Map::new();
     let mut errors = Map::new();
     if let (Some(op), Some(gpu)) = (&plan.gpu, gpu) {
-        match apply_gpu(gpu, op) {
+        let result = if inject_failure("gpu") {
+            Err("injected apply failure".to_owned())
+        } else {
+            apply_gpu(gpu, op)
+        };
+        match result {
             Ok(()) => drop(applied.insert("gpu".to_owned(), describe_gpu(op))),
             Err(e) => drop(errors.insert("gpu".to_owned(), json!(e))),
         }
     }
     if let (Some(op), Some(mobo)) = (&plan.mobo, mobo) {
-        match apply_mobo(mobo, op) {
+        let result = if inject_failure("motherboard") {
+            Err("injected apply failure".to_owned())
+        } else {
+            apply_mobo(mobo, op)
+        };
+        match result {
             Ok(()) => drop(applied.insert("motherboard".to_owned(), describe_mobo(op))),
             Err(e) => drop(errors.insert("motherboard".to_owned(), json!(e))),
         }
@@ -893,6 +1073,103 @@ fn read_input(mut reader: impl BufRead, tx: mpsc::SyncSender<Input>) -> io::Resu
     }
 }
 
+/// Replies go through a bounded queue to a writer thread, so a client that stops
+/// reading can block only that thread: never hold timers, signals or restoration.
+struct Output {
+    tx: mpsc::SyncSender<String>,
+    failure: Arc<Mutex<Option<String>>>,
+}
+
+const OUTPUT_QUEUE: usize = 64;
+
+impl Output {
+    fn spawn(mut sink: impl Write + Send + 'static) -> Self {
+        let (tx, rx) = mpsc::sync_channel::<String>(OUTPUT_QUEUE);
+        let failure = Arc::new(Mutex::new(None));
+        let record = Arc::clone(&failure);
+        std::thread::spawn(move || {
+            for line in rx {
+                if let Err(e) = writeln!(sink, "{line}").and_then(|()| sink.flush()) {
+                    *record.lock().unwrap() = Some(format!("stdout: {e}"));
+                    return; // dropping rx makes further sends fail immediately
+                }
+            }
+        });
+        Self { tx, failure }
+    }
+
+    fn failure(&self) -> Option<String> {
+        self.failure.lock().unwrap().clone()
+    }
+
+    fn send(&self, reply: &Value) -> Result<(), String> {
+        if let Some(error) = self.failure() {
+            return Err(error);
+        }
+        match self.tx.try_send(reply.to_string()) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => {
+                Err("client is not reading responses (output backlog full)".to_owned())
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(self
+                .failure()
+                .unwrap_or_else(|| "stdout: writer stopped".to_owned())),
+        }
+    }
+}
+
+/// Main loop. Returns Ok on EOF or a shutdown signal and Err on a transport failure;
+/// the caller runs the same cleanup either way.
+fn run_loop(
+    server: &mut Server,
+    rx: &mpsc::Receiver<Input>,
+    out: &Output,
+    stop: &AtomicBool,
+) -> Result<(), String> {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            crate::diag::log("asus-aura mcp: shutdown signal received");
+            return Ok(());
+        }
+        if let Some(error) = out.failure() {
+            return Err(error);
+        }
+        server.expire_if_due(Instant::now());
+        let wait = server
+            .next_deadline()
+            .map(|d| d.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::from_millis(250))
+            .min(Duration::from_millis(250));
+        let input = match rx.recv_timeout(wait) {
+            Ok(input) => input,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return Ok(()),
+        };
+        let reply = match input {
+            Input::TooLarge => Some(rpc_error(&Value::Null, -32600, "message too large")),
+            Input::Line(line) if line.trim().is_empty() => None,
+            Input::Line(line) => server.handle_line(&line),
+        };
+        if let Some(reply) = reply {
+            out.send(&reply)?;
+        }
+    }
+}
+
+/// Single exit path for every way a session can end: restore the saved lighting,
+/// retrying failed devices a bounded number of times.
+fn shutdown_cleanup(server: &mut Server) {
+    for failure in server.restore_baseline().failed {
+        crate::diag::log(&format!(
+            "asus-aura mcp: baseline restore failed: {failure}"
+        ));
+    }
+    while server.hold.is_some() {
+        std::thread::sleep(Duration::from_millis(250));
+        server.expire_if_due(Instant::now());
+    }
+}
+
 pub fn serve(dry_run: bool) -> Result<(), String> {
     // Linux signal handlers only set a lock-free flag; restoration stays on this thread.
     for signum in [2, 15] {
@@ -909,47 +1186,19 @@ pub fn serve(dry_run: bool) -> Result<(), String> {
     // Blocking reads live on their own thread so the loop can fire revert timers.
     std::thread::spawn(move || {
         if let Err(error) = read_input(io::stdin().lock(), tx) {
-            eprintln!("asus-aura mcp: input error: {error}");
+            crate::diag::log(&format!("asus-aura mcp: input error: {error}"));
         }
     });
-    let mut out = io::stdout().lock();
-    loop {
-        if SHUTDOWN.load(Ordering::Relaxed) {
-            eprintln!("asus-aura mcp: shutdown signal received");
-            break;
-        }
-        server.expire_if_due(Instant::now());
-        let wait = server
-            .next_deadline()
-            .map(|d| d.saturating_duration_since(Instant::now()))
-            .unwrap_or(Duration::from_millis(250))
-            .min(Duration::from_millis(250));
-        let input = match rx.recv_timeout(wait) {
-            Ok(input) => input,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => break,
-        };
-        let reply = match input {
-            Input::TooLarge => Some(rpc_error(&Value::Null, -32600, "message too large")),
-            Input::Line(line) if line.trim().is_empty() => None,
-            Input::Line(line) => server.handle_line(&line),
-        };
-        if let Some(reply) = reply {
-            writeln!(out, "{reply}")
-                .and_then(|()| out.flush())
-                .map_err(|e| e.to_string())?;
-        }
+    let out = Output::spawn(io::stdout());
+    let outcome = run_loop(&mut server, &rx, &out, &SHUTDOWN);
+    shutdown_cleanup(&mut server);
+    if let Err(error) = &outcome {
+        crate::diag::log(&format!("asus-aura mcp: ending session: {error}"));
+    } else {
+        crate::diag::log("asus-aura mcp: clean shutdown");
     }
-    // Client went away: leave the user's lighting as it was.
-    if let Err(e) = server.restore_baseline() {
-        eprintln!("asus-aura mcp: {e}");
-    }
-    while server.hold.is_some() {
-        std::thread::sleep(Duration::from_millis(250));
-        server.expire_if_due(Instant::now());
-    }
-    eprintln!("asus-aura mcp: clean shutdown");
-    Ok(())
+    crate::diag::flush(Duration::from_millis(500));
+    outcome
 }
 
 #[cfg(test)]
@@ -1212,7 +1461,7 @@ mod tests {
             json!({"state": "success", "duration_seconds": 1}),
         );
         assert_eq!(server.hold.as_ref().unwrap().state, "success");
-        assert!(server.hold.as_ref().unwrap().baseline.gpu.is_some());
+        assert!(server.hold.as_ref().unwrap().gpu.is_some());
         let status = tool(&mut server, "aura_get_status", json!({}));
         assert_eq!(
             status["structuredContent"]["agent_state"]["state"],
@@ -1238,34 +1487,186 @@ mod tests {
         );
     }
 
+    fn body(result: &Value) -> &Value {
+        &result["structuredContent"]
+    }
+
+    fn working(server: &mut Server) {
+        let result = tool(server, "aura_agent_state", json!({"state": "working"}));
+        assert_eq!(result["isError"], false, "{result}");
+    }
+
     #[test]
-    fn failed_restore_retains_baseline_retries_and_gives_up() {
+    fn gpu_only_override_keeps_the_motherboard_baseline() {
         let mut server = Server::new(true);
-        tool(&mut server, "aura_agent_state", json!({"state": "working"}));
-        server.fail_restore = true;
+        working(&mut server);
+        let result = tool(
+            &mut server,
+            "aura_set_color",
+            json!({"target": "gpu", "color": "112233"}),
+        );
+        assert_eq!(body(&result)["agent_hold_released"], json!(["gpu"]));
+        assert!(server.hold.as_ref().unwrap().gpu.is_none());
+        assert!(server.hold.as_ref().unwrap().mobo.is_some());
+        let idle = tool(&mut server, "aura_agent_state", json!({"state": "idle"}));
+        assert_eq!(body(&idle)["restored_devices"], json!(["motherboard"]));
+        assert_eq!(body(&idle)["not_enrolled"], json!(["gpu"]));
+        assert_eq!(
+            server.restore_calls,
+            ["motherboard"],
+            "GPU manual change is never rewritten"
+        );
+        assert!(server.hold.is_none());
+    }
+
+    #[test]
+    fn motherboard_only_override_keeps_the_gpu_baseline() {
+        let mut server = Server::new(true);
+        working(&mut server);
+        tool(
+            &mut server,
+            "aura_set_color",
+            json!({"target": "mobo", "color": "112233"}),
+        );
+        assert!(server.hold.as_ref().unwrap().gpu.is_some());
+        assert!(server.hold.as_ref().unwrap().mobo.is_none());
+        let idle = tool(&mut server, "aura_agent_state", json!({"state": "idle"}));
+        assert_eq!(body(&idle)["restored_devices"], json!(["gpu"]));
+        assert_eq!(server.restore_calls, ["gpu"]);
+    }
+
+    #[test]
+    fn one_sided_manual_failure_does_not_roll_back_the_successful_side() {
+        let mut server = Server::new(true);
+        working(&mut server);
+        server.faults.push(("apply", "motherboard"));
+        let result = tool(&mut server, "aura_set_color", json!({"color": "112233"}));
+        assert_eq!(result["isError"], true);
+        assert!(body(&result)["applied"]["gpu"].is_object());
+        assert!(body(&result)["errors"]["motherboard"].is_string());
+        assert!(
+            server.hold.as_ref().unwrap().gpu.is_none(),
+            "GPU change is final"
+        );
+        assert!(
+            server.hold.as_ref().unwrap().mobo.is_some(),
+            "failed side keeps its recovery state"
+        );
+        server.faults.clear();
+        server.expire_if_due(server.next_deadline().unwrap());
+        assert_eq!(server.restore_calls, ["motherboard"]);
+        assert!(server.hold.is_none());
+    }
+
+    #[test]
+    fn restore_failure_on_one_device_never_replays_the_other() {
+        let mut server = Server::new(true);
+        working(&mut server);
+        server.faults.push(("restore", "motherboard"));
         let idle = tool(&mut server, "aura_agent_state", json!({"state": "idle"}));
         assert_eq!(idle["isError"], true);
+        assert_eq!(body(&idle)["restored_devices"], json!(["gpu"]));
         let hold = server.hold.as_ref().unwrap();
-        assert!(hold.baseline.gpu.is_some());
-        assert!(hold.baseline.mobo.is_some());
-        assert_eq!(hold.restore_attempts, 1);
+        assert!(hold.gpu.is_none() && hold.mobo.as_ref().unwrap().attempts == 1);
         assert!(hold.deadline > Instant::now() + Duration::from_secs(4));
         assert_eq!(server.hold_status()["state"], "restoring");
-        server.expire_if_due(Instant::now());
-        assert_eq!(server.hold.as_ref().unwrap().restore_attempts, 1);
-        server.fail_restore = false;
-        server.expire_if_due(server.next_deadline().unwrap());
-        assert!(server.hold.is_none());
+        assert_eq!(
+            server.hold_status()["baseline_devices"],
+            json!(["motherboard"])
+        );
 
-        tool(&mut server, "aura_agent_state", json!({"state": "working"}));
-        server.fail_restore = true;
-        for attempt in 1..=3 {
-            assert!(server.restore_baseline().is_err());
+        server.expire_if_due(Instant::now()); // retry not due yet
+        assert_eq!(server.restore_calls, ["gpu", "motherboard"]);
+        server.faults.clear();
+        server.expire_if_due(server.next_deadline().unwrap());
+        assert_eq!(server.restore_calls, ["gpu", "motherboard", "motherboard"]);
+        assert!(server.hold.is_none());
+    }
+
+    #[test]
+    fn restore_gives_up_per_device_after_three_attempts() {
+        let mut server = Server::new(true);
+        working(&mut server);
+        server.faults.push(("restore", "gpu"));
+        for attempt in 1..=3u8 {
+            let report = server.restore_baseline();
+            assert_eq!(report.failed.len(), 1);
             if attempt < 3 {
-                assert_eq!(server.hold.as_ref().unwrap().restore_attempts, attempt);
+                assert_eq!(
+                    server.hold.as_ref().unwrap().gpu.as_ref().unwrap().attempts,
+                    attempt
+                );
             }
         }
         assert!(server.hold.is_none());
+    }
+
+    #[test]
+    fn device_without_a_saved_baseline_is_never_mutated() {
+        let mut server = Server::new(true);
+        server.faults.push(("snapshot", "gpu"));
+        let result = tool(&mut server, "aura_agent_state", json!({"state": "working"}));
+        assert_eq!(result["isError"], false);
+        assert!(
+            body(&result)["applied"].get("gpu").is_none(),
+            "GPU must not be written"
+        );
+        assert!(body(&result)["applied"]["motherboard"].is_object());
+        assert!(body(&result)["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("gpu excluded"));
+        assert_eq!(body(&result)["baseline_devices"], json!(["motherboard"]));
+        assert!(server.hold.as_ref().unwrap().gpu.is_none());
+
+        // The device recovers: it is enrolled (baseline first) on the next state change.
+        server.faults.clear();
+        let next = tool(
+            &mut server,
+            "aura_agent_state",
+            json!({"state": "reviewing"}),
+        );
+        assert!(body(&next)["applied"]["gpu"].is_object());
+        assert_eq!(
+            body(&next)["baseline_devices"],
+            json!(["gpu", "motherboard"])
+        );
+        let idle = tool(&mut server, "aura_agent_state", json!({"state": "idle"}));
+        assert_eq!(
+            body(&idle)["restored_devices"],
+            json!(["gpu", "motherboard"])
+        );
+    }
+
+    #[test]
+    fn no_recoverable_device_fails_the_call_and_keeps_existing_holds() {
+        let mut server = Server::new(true);
+        server
+            .faults
+            .extend([("snapshot", "gpu"), ("snapshot", "motherboard")]);
+        let result = tool(&mut server, "aura_agent_state", json!({"state": "working"}));
+        assert_eq!(result["isError"], true);
+        assert!(server.hold.is_none());
+        let idle = tool(&mut server, "aura_agent_state", json!({"state": "idle"}));
+        assert_eq!(
+            body(&idle)["baseline_restored"],
+            false,
+            "an empty baseline claims nothing"
+        );
+        assert_eq!(body(&idle)["restored_devices"], json!([]));
+
+        server.faults.clear();
+        working(&mut server);
+        server
+            .faults
+            .extend([("open", "gpu"), ("open", "motherboard")]);
+        let again = tool(&mut server, "aura_agent_state", json!({"state": "success"}));
+        assert_eq!(again["isError"], true);
+        assert!(
+            server.hold.as_ref().unwrap().gpu.is_some(),
+            "existing baselines survive"
+        );
+        assert_eq!(server.hold.as_ref().unwrap().state, "working");
     }
 
     #[test]

@@ -2,33 +2,96 @@
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+const STDERR_KEEP: usize = 1 << 20;
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Test client with bounded waits: stderr is drained continuously (so a chatty server
+/// can never block on a full pipe), replies and shutdown have deadlines, and the child
+/// is always killed and reaped.
 struct Client {
     child: Child,
     stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    lines: mpsc::Receiver<String>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    drains: Vec<JoinHandle<()>>,
     next_id: u64,
 }
 
 impl Client {
     fn start() -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_asus-aura-cli"))
-            .args(["--dry-run", "mcp"])
+        Self::spawn(env!("CARGO_BIN_EXE_asus-aura-cli"), &["--dry-run", "mcp"])
+    }
+
+    fn spawn(program: &str, args: &[&str]) -> Self {
+        Self::spawn_with_stdout(program, args, None)
+    }
+
+    /// Server whose stdout goes to a caller-supplied sink (a pipe the test controls,
+    /// `/dev/full`, ...). No stdout reader runs, so `request`/`read` are unavailable.
+    fn start_with_stdout(stdout: Stdio) -> Self {
+        Self::spawn_with_stdout(
+            env!("CARGO_BIN_EXE_asus-aura-cli"),
+            &["--dry-run", "mcp"],
+            Some(stdout),
+        )
+    }
+
+    fn spawn_with_stdout(program: &str, args: &[&str], stdout_sink: Option<Stdio>) -> Self {
+        let custom_stdout = stdout_sink.is_some();
+        let mut child = Command::new(program)
+            .args(args)
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+            .stdout(stdout_sink.unwrap_or_else(Stdio::piped))
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn mcp server");
         let stdin = child.stdin.take();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let stdout = child.stdout.take();
+        let mut stderr_pipe = child.stderr.take().unwrap();
+        let (tx, lines) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            if let Some(stdout) = stdout {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        let _ = custom_stdout;
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&stderr);
+        let drain = std::thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            while let Ok(n) = stderr_pipe.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                let mut buffer = sink.lock().unwrap();
+                buffer.extend_from_slice(&chunk[..n]);
+                if buffer.len() > STDERR_KEEP {
+                    let excess = buffer.len() - STDERR_KEEP;
+                    buffer.drain(..excess);
+                }
+            }
+        });
         Self {
             child,
             stdin,
-            stdout,
+            lines,
+            stderr,
+            drains: vec![reader, drain],
             next_id: 1,
         }
+    }
+
+    fn stderr_text(&self) -> String {
+        String::from_utf8_lossy(&self.stderr.lock().unwrap()).into_owned()
     }
 
     fn send(&mut self, message: Value) {
@@ -37,11 +100,31 @@ impl Client {
         stdin.flush().unwrap();
     }
 
+    fn try_read(&mut self, timeout: Duration) -> Result<Value, String> {
+        let line = self.lines.recv_timeout(timeout).map_err(|e| {
+            format!(
+                "no reply within {timeout:?} ({e}); stderr tail:\n{}",
+                self.stderr_tail()
+            )
+        })?;
+        serde_json::from_str(&line).map_err(|e| format!("stdout is not JSON ({e}): {line:?}"))
+    }
+
+    fn stderr_tail(&self) -> String {
+        let text = self.stderr_text();
+        let tail: Vec<&str> = text.lines().rev().take(20).collect();
+        tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+    }
+
     /// Every stdout line must be one JSON-RPC message; dry-run traces would break this.
     fn read(&mut self) -> Value {
-        let mut line = String::new();
-        self.stdout.read_line(&mut line).unwrap();
-        serde_json::from_str(&line).unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {line:?}"))
+        match self.try_read(READ_TIMEOUT) {
+            Ok(value) => value,
+            Err(message) => {
+                self.kill_and_reap();
+                panic!("{message}");
+            }
+        }
     }
 
     fn request(&mut self, method: &str, params: Value) -> Value {
@@ -56,13 +139,80 @@ impl Client {
     fn tool(&mut self, name: &str, arguments: Value) -> Value {
         self.request("tools/call", json!({"name": name, "arguments": arguments}))["result"].clone()
     }
+
+    /// Wait for the child to exit; on deadline kill it and fail with its stderr tail.
+    fn wait_exit(&mut self, timeout: Duration) -> ExitStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                self.join_drains();
+                return status;
+            }
+            if Instant::now() >= deadline {
+                let tail = self.stderr_tail();
+                self.kill_and_reap();
+                panic!("child did not exit within {timeout:?}; stderr tail:\n{tail}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Close stdin, wait for exit, return the status and complete (bounded) stderr.
+    fn finish(&mut self) -> (ExitStatus, String) {
+        self.stdin.take();
+        let status = self.wait_exit(Duration::from_secs(5));
+        (status, self.stderr_text())
+    }
+
+    fn join_drains(&mut self) {
+        for handle in self.drains.drain(..) {
+            let _ = handle.join();
+        }
+    }
+
+    fn kill_and_reap(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.join_drains();
+    }
 }
 
 impl Drop for Client {
     fn drop(&mut self) {
         self.stdin.take();
-        let _ = self.child.wait();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                self.join_drains();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.kill_and_reap();
     }
+}
+
+#[test]
+fn silent_child_gives_a_bounded_failure_and_is_reaped() {
+    let mut client = Client::spawn("sleep", &["30"]);
+    let pid = client.child.id();
+    let started = Instant::now();
+    let error = client.try_read(Duration::from_millis(200)).unwrap_err();
+    assert!(error.contains("no reply within"));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    client.kill_and_reap();
+    assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+}
+
+#[test]
+fn a_thousand_write_producing_calls_complete_with_stderr_drained() {
+    let mut client = Client::start();
+    for _ in 0..1000 {
+        assert_eq!(client.tool("aura_turn_off", json!({}))["isError"], false);
+    }
+    let (status, stderr) = client.finish();
+    assert!(status.success());
+    assert!(stderr.contains("GPU Write"));
 }
 
 #[test]
@@ -179,26 +329,9 @@ fn signals_restore_baseline_and_exit_cleanly() {
             .status()
             .unwrap()
             .success());
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let status = loop {
-            if let Some(status) = client.child.try_wait().unwrap() {
-                break status;
-            }
-            if Instant::now() >= deadline {
-                client.child.kill().unwrap();
-                panic!("server did not shut down promptly");
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
+        let status = client.wait_exit(Duration::from_secs(3));
         assert!(status.success());
-        let mut stderr = String::new();
-        client
-            .child
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut stderr)
-            .unwrap();
+        let stderr = client.stderr_text();
         assert!(stderr.contains("shutdown signal received"));
         assert!(stderr.contains("clean shutdown"));
         // Dry-run baseline is GPU off and motherboard rainbow.
@@ -215,16 +348,8 @@ fn static_without_color_only_writes_motherboard_mode_registers() {
         json!({"target": "mobo", "mode": "static"}),
     );
     assert_eq!(result["isError"], false);
-    client.stdin.take();
-    assert!(client.child.wait().unwrap().success());
-    let mut stderr = String::new();
-    client
-        .child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .unwrap();
+    let (status, stderr) = client.finish();
+    assert!(status.success());
     let writes: Vec<_> = stderr
         .lines()
         .filter(|line| line.contains("Mobo Write:"))
@@ -238,4 +363,132 @@ fn static_without_color_only_writes_motherboard_mode_registers() {
             "[DRY-RUN] Mobo Write: Reg 0x80a0 <= 0x01",
         ]
     );
+}
+
+fn tool_call(id: u64, name: &str, arguments: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": arguments}})
+}
+
+/// Index of the first/last occurrence, to assert restore happens after the pattern.
+fn assert_pattern_then_restore(stderr: &str, pattern_write: &str) {
+    let pattern = stderr
+        .find(pattern_write)
+        .unwrap_or_else(|| panic!("no pattern write {pattern_write:?} in:\n{stderr}"));
+    let restore = stderr
+        .rfind("GPU Write: Reg 0x07 <= 0x00")
+        .expect("baseline restore write");
+    assert!(
+        restore > pattern,
+        "baseline was not restored after the pattern:\n{stderr}"
+    );
+}
+
+#[test]
+fn closed_stdout_restores_the_baseline_before_a_failing_exit() {
+    let (reader, writer) = std::io::pipe().unwrap();
+    let mut client = Client::start_with_stdout(Stdio::from(writer));
+    let mut reader = BufReader::new(reader);
+    client.send(tool_call(
+        1,
+        "aura_agent_state",
+        json!({"state": "working"}),
+    ));
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.contains("amber_breathe"));
+    drop(reader); // the client disconnects
+    client.send(json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}));
+    let status = client.wait_exit(Duration::from_secs(5));
+    assert_eq!(status.code(), Some(1));
+    let stderr = client.stderr_text();
+    assert!(stderr.contains("Broken pipe"), "{stderr}");
+    assert!(!stderr.contains("clean shutdown"));
+    assert_pattern_then_restore(&stderr, "GPU Write: Reg 0x07 <= 0x02");
+}
+
+#[test]
+fn stdout_flush_failure_behaves_like_a_closed_pipe() {
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let mut client = Client::start_with_stdout(Stdio::from(full));
+    client.send(tool_call(
+        1,
+        "aura_agent_state",
+        json!({"state": "working"}),
+    ));
+    let status = client.wait_exit(Duration::from_secs(5));
+    assert_eq!(status.code(), Some(1));
+    let stderr = client.stderr_text();
+    assert!(stderr.contains("No space left on device"), "{stderr}");
+    assert_pattern_then_restore(&stderr, "GPU Write: Reg 0x07 <= 0x02");
+}
+
+#[test]
+fn unread_replies_do_not_stall_the_watchdog_or_sigterm() {
+    let (reader, writer) = std::io::pipe().unwrap();
+    let mut client = Client::start_with_stdout(Stdio::from(writer));
+    let mut reader = BufReader::new(reader);
+    client.send(tool_call(
+        1,
+        "aura_agent_state",
+        json!({"state": "failure", "duration_seconds": 1}),
+    ));
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    // Large replies saturate the stdout pipe and block the writer thread, but stay
+    // below the output queue bound, so the session itself must remain alive.
+    for id in 2..42 {
+        client.send(json!({"jsonrpc": "2.0", "id": id, "method": "tools/list"}));
+    }
+    std::thread::sleep(Duration::from_millis(1800));
+    assert!(
+        client.child.try_wait().unwrap().is_none(),
+        "session ended early"
+    );
+    // The one-second failure hold expired and was restored although stdout is blocked.
+    assert_pattern_then_restore(&client.stderr_text(), "GPU Write: Reg 0x07 <= 0x03");
+    assert!(Command::new("kill")
+        .args(["-TERM", &client.child.id().to_string()])
+        .status()
+        .unwrap()
+        .success());
+    assert!(client.wait_exit(Duration::from_secs(3)).success());
+    assert!(client.stderr_text().contains("shutdown signal received"));
+    drop(reader);
+}
+
+#[test]
+fn sustained_output_backpressure_ends_the_session_with_cleanup() {
+    let (reader, writer) = std::io::pipe().unwrap();
+    let mut client = Client::start_with_stdout(Stdio::from(writer));
+    let mut reader = BufReader::new(reader);
+    client.send(tool_call(
+        1,
+        "aura_agent_state",
+        json!({"state": "failure", "duration_seconds": 30}),
+    ));
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let mut stdin = client.stdin.take().unwrap();
+    let flood = std::thread::spawn(move || {
+        for id in 2..20_000u64 {
+            if writeln!(
+                stdin,
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/list"}}"#
+            )
+            .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let status = client.wait_exit(Duration::from_secs(8));
+    assert_eq!(status.code(), Some(1));
+    let stderr = client.stderr_text();
+    assert!(stderr.contains("not reading responses"), "{stderr}");
+    assert_pattern_then_restore(&stderr, "GPU Write: Reg 0x07 <= 0x03");
+    drop(reader);
+    let _ = flood.join();
 }

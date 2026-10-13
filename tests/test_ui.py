@@ -247,6 +247,59 @@ def test_refresh_preserves_staged_edits_and_disconnect_locks_writes(page, daemon
     assert daemon["writes"] == []
 
 
+@pytest.mark.parametrize("first, second", [("mobo", "gpu"), ("gpu", "mobo")])
+def test_applying_one_device_keeps_the_other_devices_staged_edit(page, daemon, first, second):
+    page.goto(URL, wait_until="networkidle")
+    expect(page.locator("#sync-all")).not_to_be_checked()
+    staged = {"gpu": "#112233", "mobo": "#abcdef"}
+    # The device edited last is the active one, so it is the one Apply sends first.
+    for device in (second, first):
+        set_color(page, f"#{device}-color", staged[device])
+    page.locator("#btn-apply").click()
+    expect(page.locator("#status-toast")).to_contain_text("still staged")
+    assert [(w["target"], "#" + w["color"]) for w in daemon["writes"]] == [(first, staged[first])]
+    # The refresh that follows the apply must not overwrite the other staged device.
+    expect(page.locator(f"#{second}-color")).to_have_value(staged[second])
+    page.locator("#btn-refresh").click()
+    expect(page.locator("#btn-refresh")).to_be_enabled()
+    expect(page.locator(f"#{second}-color")).to_have_value(staged[second])
+    # The remaining staged payload is what the next Apply sends.
+    page.locator("#btn-apply").click()
+    expect(page.locator("#status-toast")).to_have_text("✓ Applied to hardware.")
+    assert [(w["target"], "#" + w["color"]) for w in daemon["writes"]] == [
+        (first, staged[first]), (second, staged[second])]
+    expect(page.locator(f"#{first}-color")).to_have_value(staged[first])
+
+
+def test_failed_apply_keeps_both_devices_staged_through_refresh(page, daemon):
+    page.goto(URL, wait_until="networkidle")
+    set_color(page, "#gpu-color", "#112233")
+    set_color(page, "#mobo-color", "#abcdef")
+    daemon["apply_error"] = "device busy"
+    page.locator("#btn-apply").click()
+    expect(page.locator("#status-toast")).to_contain_text("Apply failed")
+    page.locator("#btn-refresh").click()
+    expect(page.locator("#btn-refresh")).to_be_enabled()
+    expect(page.locator("#gpu-color")).to_have_value("#112233")
+    expect(page.locator("#mobo-color")).to_have_value("#abcdef")
+    daemon["apply_error"] = None
+    page.locator("#btn-apply").click()
+    expect(page.locator("#status-toast")).to_contain_text("still staged")
+    assert [w["target"] for w in daemon["writes"]] == ["mobo", "mobo"]
+    page.locator("#btn-apply").click()
+    expect(page.locator("#status-toast")).to_have_text("✓ Applied to hardware.")
+    assert [w["target"] for w in daemon["writes"]] == ["mobo", "mobo", "gpu"]
+
+
+def test_linked_edits_stage_both_devices_and_apply_clears_both(page, daemon):
+    page.goto(URL, wait_until="networkidle")
+    page.locator("#sync-all").check()
+    set_color(page, "#gpu-color", "#445566")
+    page.locator("#btn-apply").click()
+    expect(page.locator("#status-toast")).to_have_text("✓ Applied to hardware.")
+    assert [w["target"] for w in daemon["writes"]] == ["all"]
+
+
 def test_copy_feedback_and_hover_active_states(page, daemon):
     page.goto(URL, wait_until="networkidle")
     page.evaluate("Object.defineProperty(navigator, 'clipboard', {value: {writeText: async text => {window.copiedText=text;}}})")

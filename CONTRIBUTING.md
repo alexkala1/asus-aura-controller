@@ -27,7 +27,7 @@ The web UI tests use Python 3.12 and Playwright Chromium, with the same pinned d
 uv venv --python 3.12
 uv pip install -r requirements-ui.txt
 uv run --no-project python -m playwright install chromium
-uv run --no-project pytest tests/test_ui.py
+uv run --no-project pytest tests/test_ui.py tests/test_serve.py
 ```
 
 On Ubuntu, add `--with-deps` to the Playwright install command to install its system dependencies. The tests regenerate `web/screenshot*.png`; commit those only when the UI changed.

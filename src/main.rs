@@ -1,3 +1,4 @@
+mod diag;
 mod gpu;
 mod hardware_lock;
 mod mcp;
@@ -202,14 +203,22 @@ pub fn run(cli: Cli) -> Result<String, String> {
                         )
                     });
                 gpu.set_color(r, g, b, gpu_mode)?;
+                let hex = color.as_deref().unwrap_or_default().trim_start_matches('#');
                 if mobo_mode == MoboMode::Static {
                     mobo.set_color_static(r, g, b)?;
+                } else if mobo_mode.uses_color() {
+                    // Writes the effect color buffer and leaves direct mode.
+                    mobo.set_effect(mobo_mode, 0, Some((r, g, b)))?;
                 } else {
-                    mobo.set_mode(mobo_mode, 0, 0)?;
+                    mobo.set_effect(mobo_mode, 0, None)?;
+                    return Ok(format!(
+                        "[ALL] GPU set to #{hex} (Mode: {}); motherboard effect {} generates its own colors.",
+                        gpu_mode.name(),
+                        mobo_mode.name()
+                    ));
                 }
                 Ok(format!(
-                    "[ALL] Synchronized GPU and Motherboard to #{} (Mode: {mode}).",
-                    color.as_deref().unwrap_or_default().trim_start_matches('#')
+                    "[ALL] Synchronized GPU and Motherboard to #{hex} (Mode: {mode})."
                 ))
             } else {
                 gpu.set_mode(GpuMode::Off)?;
@@ -329,11 +338,11 @@ mod cli_tests {
             ),
             (
                 vec!["all", "--color", "112233", "--mode", "rainbow"],
-                "[ALL] Synchronized GPU and Motherboard to #112233 (Mode: rainbow).",
+                "[ALL] GPU set to #112233 (Mode: static); motherboard effect rainbow generates its own colors.",
             ),
             (
                 vec!["all", "--color", "112233", "--mode", "rainbow_breathing"],
-                "[ALL] Synchronized GPU and Motherboard to #112233 (Mode: rainbow-breathing).",
+                "[ALL] GPU set to #112233 (Mode: static); motherboard effect rainbow_breathing generates its own colors.",
             ),
         ] {
             let cli = Cli::try_parse_from(["aura", "--dry-run"].into_iter().chain(args)).unwrap();

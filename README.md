@@ -86,11 +86,13 @@ sudo install -m 0755 target/release/asus-aura-cli /usr/local/bin/asus-aura-cli
 
 Each agent starts its own server process. Hardware access is serialized with advisory locks on the device files themselves (`/dev/i2c-0`, `/dev/port`). The saved baseline is per process: agents setting states simultaneously can capture each other's pattern as their baseline. Have only one agent drive `aura_agent_state` at a time.
 
+Within one server, baselines are kept per device. A device joins an agent pattern only after its baseline was read successfully (otherwise it is skipped and reported under `warnings`), an explicit set/off call releases only the devices it changed, and a failed restore on one device is retried (up to 3 times) without rewriting the other. If the client stops reading replies or closes stdout, the server restores the saved lighting and exits with an error.
+
 `asus-aura-cli mcp` speaks newline-delimited JSON-RPC 2.0 on stdio (protocol versions 2025-06-18, 2025-03-26, 2024-11-05). stdout carries protocol messages only; logs and `--dry-run` register traces go to stderr.
 
 | Tool | Arguments | Notes |
 | --- | --- | --- |
-| `aura_get_status` | none | Device state, firmware, active agent hold. A device that cannot be opened reports `{"error": ...}` instead of failing the call. |
+| `aura_get_status` | none | Device state, firmware, active agent hold. Motherboard `zones` report the active color buffer (`color_source`: `direct` or `effect`), i.e. the configured color, not a sample of a running animation. A device that cannot be opened reports `{"error": ...}` instead of failing the call. |
 | `aura_set_color` | `color`, `target` (`all`/`gpu`/`mobo`), `zone` (0–4, motherboard only) | |
 | `aura_set_effect` | `mode`, `color?`, `target?`, `speed?` (0–4, motherboard only) | The GPU supports static, breathing, strobing, color-cycle. Other modes fall back to static GPU color and the response `notes` say so. |
 | `aura_turn_off` | `target?` | |

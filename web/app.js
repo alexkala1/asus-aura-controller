@@ -18,7 +18,10 @@ const $ = selector => document.querySelector(selector);
 let active = channels[0];
 let connected = false;
 let busy = false;
-let dirty = false;
+// Staged (unapplied) edits are tracked per device so applying or refreshing one device
+// never discards the other's pending changes.
+const dirty = { gpu: false, mobo: false };
+const deviceKey = channel => (channel.id === "gpu" ? "gpu" : "mobo");
 let refreshing = false;
 const sync = $("#sync-all");
 const apply = $("#btn-apply");
@@ -54,7 +57,7 @@ for (const channel of channels) {
       if (key === "color" && target.id === "mobo") zoneColors.fill(value);
       if (key === "mode") target.nativeMode = null;
     }
-    dirty = true;
+    for (const target of linked) dirty[deviceKey(target)] = true;
     setControlState("default");
     notify("Changes staged. Apply to update hardware.", "default");
     render();
@@ -192,8 +195,10 @@ async function refreshStatus() {
     const result = await api("/api/status");
     if (result.mode !== "live") throw new Error("Daemon did not return live hardware status.");
     const { gpu, mobo, gpuMode, moboMode } = hardwareData(result.data);
-    if (!dirty) {
+    if (!dirty.gpu) {
       Object.assign(channels[0], { color: `#${gpu.color_hex}`, mode: gpuMode, nativeMode: gpu.mode.replaceAll("_", "-") });
+    }
+    if (!dirty.mobo) {
       zoneColors = mobo.zones.map(zone => `#${zone.hex}`);
       Object.assign(channels[1], { color: zoneColors[0], mode: moboMode, nativeMode: mobo.mode.replaceAll("_", "-"), speed: mobo.speed });
     }
@@ -234,9 +239,17 @@ apply.addEventListener("click", async () => {
   let succeeded = false;
   try {
     await api("/api/apply", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-    dirty = false;
+    const applied = payload.target === "all" ? channels : [channels[payload.target === "gpu" ? 0 : 1]];
+    for (const channel of applied) dirty[deviceKey(channel)] = false;
     succeeded = true;
-    notify("✓ Applied to hardware.", "success");
+    const pending = channels.find(channel => dirty[deviceKey(channel)]);
+    if (pending) {
+      // Point the next Apply at the device that is still staged.
+      active = pending;
+      notify(`✓ Applied. ${pending.name} changes are still staged.`, "success");
+    } else {
+      notify("✓ Applied to hardware.", "success");
+    }
     setControlState("success");
   } catch (error) {
     notify(`Apply failed: ${error.message} Settings remain staged; retry when ready.`, "error");
@@ -264,8 +277,8 @@ sync.addEventListener("change", () => {
   if (sync.checked) {
     for (const channel of channels) Object.assign(channel, { color: active.color, mode: active.mode, nativeMode: active.nativeMode, speed: active.speed });
     zoneColors.fill(active.color);
+    dirty.gpu = dirty.mobo = true; // linking stages the mirrored settings on both devices
   }
-  dirty = true;
   setControlState("default");
   render();
 });

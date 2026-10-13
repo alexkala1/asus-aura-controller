@@ -43,7 +43,8 @@ jobs:
           uv venv --python 3.12
           uv pip install -r requirements-ui.txt
           uv run --no-project python -m playwright install --with-deps chromium
-      - run: uv run --no-project pytest tests/test_ui.py
+      - run: uv run --no-project pytest tests/test_ui.py tests/test_serve.py
+      - run: python3 -m unittest tests.test_aura
 
   release-build:
     runs-on: ubuntu-latest
