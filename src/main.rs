@@ -33,7 +33,7 @@ enum Command {
     Gpu {
         #[arg(long)]
         color: Option<String>,
-        #[arg(long, value_enum, default_value = "static")]
+        #[arg(long, default_value = "static", value_parser = parse_gpu_mode)]
         mode: GpuMode,
         #[arg(long)]
         off: bool,
@@ -49,13 +49,36 @@ enum Command {
         off: bool,
     },
     All {
-        #[arg(long, required_unless_present = "off")]
+        /// Required for static mode; optional for effects (autonomous ones ignore it).
+        #[arg(long)]
         color: Option<String>,
         #[arg(long, default_value = "static", value_parser = parse_all_mode)]
         mode: String,
         #[arg(long)]
         off: bool,
     },
+}
+
+/// GPU modes by name, plus the cross-device effect names that map onto the GPU's
+/// built-in color cycle: its only autonomous effect.
+fn parse_gpu_mode(name: &str) -> Result<GpuMode, String> {
+    let normalized = name.replace('_', "-");
+    match normalized.as_str() {
+        "rainbow" | "color-cycle" => Ok(GpuMode::Spectrum),
+        _ => GpuMode::from_str(&normalized, false),
+    }
+}
+
+/// Resolve an `all --mode` name to the GPU and motherboard modes it selects.
+fn resolve_all_mode(mode: &str) -> (GpuMode, MoboMode) {
+    mcp::find_effect(mode)
+        .map(|(gpu, mobo, _)| (gpu.unwrap_or(GpuMode::Static), mobo))
+        .unwrap_or_else(|| {
+            (
+                GpuMode::from_str(mode, false).unwrap_or(GpuMode::Static),
+                parse_mobo_mode(mode).unwrap_or(MoboMode::Static),
+            )
+        })
 }
 
 fn parse_mobo_mode(name: &str) -> Result<MoboMode, String> {
@@ -164,70 +187,76 @@ pub fn run(cli: Cli) -> Result<String, String> {
             speed,
             off,
         } => {
-            if color.is_some() && mode != MoboMode::Static && !off {
-                eprintln!("warning: --color is ignored for effect modes; motherboard effects keep their stored colors");
-            }
             if off {
                 mobo_controller(dry)?.set_mode(MoboMode::Off, 0, 0)?;
-                Ok("[MOBO] LEDs turned off.".to_owned())
-            } else if let Some(color) = color.filter(|_| mode == MoboMode::Static) {
-                let (r, g, b) = parse_hex_color(&color)?;
-                mobo_controller(dry)?.set_color_static(r, g, b)?;
-                Ok(format!(
-                    "[MOBO] Static color set to #{}.",
-                    color.trim_start_matches('#')
-                ))
-            } else {
-                mobo_controller(dry)?.set_mode(mode, speed, 0)?;
-                Ok(format!(
-                    "[MOBO] Mode set to {} (Speed: {speed}).",
-                    mode.name()
-                ))
+                return Ok("[MOBO] LEDs turned off.".to_owned());
+            }
+            let rgb = color.as_deref().map(parse_hex_color).transpose()?;
+            let hex = color.as_deref().unwrap_or_default().trim_start_matches('#');
+            match rgb {
+                Some((r, g, b)) if mode == MoboMode::Static => {
+                    mobo_controller(dry)?.set_color_static(r, g, b)?;
+                    Ok(format!("[MOBO] Static color set to #{hex}."))
+                }
+                Some(rgb) if mode.uses_color() => {
+                    // Color-driven effects take their color from the effect buffer.
+                    mobo_controller(dry)?.set_effect(mode, speed, Some(rgb))?;
+                    Ok(format!(
+                        "[MOBO] Mode set to {} with color #{hex} (Speed: {speed}).",
+                        mode.name()
+                    ))
+                }
+                _ => {
+                    if rgb.is_some() {
+                        eprintln!("warning: --color is ignored for effect modes that generate their own colors");
+                    }
+                    mobo_controller(dry)?.set_mode(mode, speed, 0)?;
+                    Ok(format!(
+                        "[MOBO] Mode set to {} (Speed: {speed}).",
+                        mode.name()
+                    ))
+                }
             }
         }
         Command::All { color, mode, off } => {
             // Validate before opening either device or changing either controller.
-            let rgb = if off {
-                None
-            } else {
-                Some(parse_hex_color(
-                    color.as_deref().ok_or("--color is required unless --off")?,
-                )?)
-            };
+            let rgb = color.as_deref().map(parse_hex_color).transpose()?;
+            let (gpu_mode, mobo_mode) = resolve_all_mode(&mode);
+            if !off && rgb.is_none() && mobo_mode == MoboMode::Static {
+                return Err("--color is required for static mode".to_owned());
+            }
             let mut gpu = gpu_controller(dry)?;
             let mut mobo = mobo_controller(dry)?;
-            if let Some((r, g, b)) = rgb {
-                let (gpu_mode, mobo_mode) = mcp::find_effect(&mode)
-                    .map(|(gpu, mobo, _)| (gpu.unwrap_or(GpuMode::Static), mobo))
-                    .unwrap_or_else(|| {
-                        (
-                            GpuMode::from_str(&mode, false).unwrap_or(GpuMode::Static),
-                            parse_mobo_mode(&mode).unwrap_or(MoboMode::Static),
-                        )
-                    });
-                gpu.set_color(r, g, b, gpu_mode)?;
-                let hex = color.as_deref().unwrap_or_default().trim_start_matches('#');
-                if mobo_mode == MoboMode::Static {
-                    mobo.set_color_static(r, g, b)?;
-                } else if mobo_mode.uses_color() {
-                    // Writes the effect color buffer and leaves direct mode.
-                    mobo.set_effect(mobo_mode, 0, Some((r, g, b)))?;
-                } else {
-                    mobo.set_effect(mobo_mode, 0, None)?;
-                    return Ok(format!(
-                        "[ALL] GPU set to #{hex} (Mode: {}); motherboard effect {} generates its own colors.",
-                        gpu_mode.name(),
-                        mobo_mode.name()
-                    ));
-                }
-                Ok(format!(
-                    "[ALL] Synchronized GPU and Motherboard to #{hex} (Mode: {mode})."
-                ))
-            } else {
+            if off {
                 gpu.set_mode(GpuMode::Off)?;
                 mobo.set_mode(MoboMode::Off, 0, 0)?;
-                Ok("[ALL] GPU and Motherboard LEDs turned off.".to_owned())
+                return Ok("[ALL] GPU and Motherboard LEDs turned off.".to_owned());
             }
+            let hex = color.as_deref().unwrap_or_default().trim_start_matches('#');
+            match rgb {
+                Some((r, g, b)) => gpu.set_color(r, g, b, gpu_mode)?,
+                None => gpu.set_mode(gpu_mode)?,
+            }
+            match (rgb, mobo_mode) {
+                (Some((r, g, b)), MoboMode::Static) => mobo.set_color_static(r, g, b)?,
+                (Some(rgb), m) if m.uses_color() => mobo.set_effect(m, 0, Some(rgb))?,
+                (_, m) => mobo.set_effect(m, 0, None)?, // autonomous, or keep stored colors
+            }
+            Ok(match rgb {
+                Some(_) if mobo_mode == MoboMode::Static || mobo_mode.uses_color() => {
+                    format!("[ALL] Synchronized GPU and Motherboard to #{hex} (Mode: {mode}).")
+                }
+                Some(_) => format!(
+                    "[ALL] GPU set to #{hex} (Mode: {}); motherboard effect {} generates its own colors.",
+                    gpu_mode.name(),
+                    mobo_mode.name()
+                ),
+                None => format!(
+                    "[ALL] GPU mode {}; motherboard mode {} (colors unchanged).",
+                    gpu_mode.name(),
+                    mobo_mode.name()
+                ),
+            })
         }
     }
 }
@@ -284,13 +313,50 @@ mod cli_tests {
     }
 
     #[test]
+    fn color_is_required_only_for_static_all() {
+        // Static needs a color; this is reported before any device is opened.
+        let cli = Cli::try_parse_from(["luminactl", "--dry-run", "all"]).unwrap();
+        assert_eq!(run(cli).unwrap_err(), "--color is required for static mode");
+        let cli =
+            Cli::try_parse_from(["luminactl", "--dry-run", "all", "--mode", "static"]).unwrap();
+        assert!(run(cli).is_err());
+        // Effects (autonomous or color-driven) and off need none.
+        for mode in [
+            "rainbow",
+            "rainbow-breathing",
+            "spectrum",
+            "wave",
+            "rainbow-pulse",
+            "random-flicker",
+            "starry-night",
+            "breathing",
+            "flashing",
+            "off",
+        ] {
+            let cli =
+                Cli::try_parse_from(["luminactl", "--dry-run", "all", "--mode", mode]).unwrap();
+            assert!(run(cli).is_ok(), "{mode}");
+        }
+        let cli = Cli::try_parse_from(["luminactl", "--dry-run", "all", "--off"]).unwrap();
+        assert!(run(cli).is_ok());
+    }
+
+    #[test]
+    fn gpu_accepts_rainbow_and_color_cycle_as_spectrum() {
+        for mode in ["rainbow", "color-cycle", "color_cycle", "spectrum"] {
+            let cli =
+                Cli::try_parse_from(["luminactl", "--dry-run", "gpu", "--mode", mode]).unwrap();
+            assert_eq!(run(cli).unwrap(), "[GPU] Mode set to spectrum.", "{mode}");
+        }
+    }
+
+    #[test]
     fn rejects_invalid_arguments() {
         for args in [
             vec!["luminactl"],
-            vec!["luminactl", "all"],
             vec!["luminactl", "mobo", "--speed", "5"],
             vec!["luminactl", "mobo", "--speed", "-1"],
-            vec!["luminactl", "gpu", "--mode", "rainbow"],
+            vec!["luminactl", "gpu", "--mode", "wave"],
             vec!["luminactl", "mobo", "--mode", "invalid"],
             vec!["luminactl", "all", "--color", "112233", "--mode", "invalid"],
         ] {
@@ -348,11 +414,11 @@ mod cli_tests {
             ),
             (
                 vec!["all", "--color", "112233", "--mode", "rainbow"],
-                "[ALL] GPU set to #112233 (Mode: static); motherboard effect rainbow generates its own colors.",
+                "[ALL] GPU set to #112233 (Mode: spectrum); motherboard effect rainbow generates its own colors.",
             ),
             (
                 vec!["all", "--color", "112233", "--mode", "rainbow_breathing"],
-                "[ALL] GPU set to #112233 (Mode: static); motherboard effect rainbow_breathing generates its own colors.",
+                "[ALL] GPU set to #112233 (Mode: spectrum); motherboard effect rainbow_breathing generates its own colors.",
             ),
         ] {
             let cli = Cli::try_parse_from(["luminactl", "--dry-run"].into_iter().chain(args)).unwrap();

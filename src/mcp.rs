@@ -48,8 +48,12 @@ const EFFECTS: [(&[&str], Option<GpuMode>, MoboMode); 13] = [
         Some(GpuMode::Spectrum),
         MoboMode::Spectrum,
     ),
-    (&["rainbow"], None, MoboMode::Rainbow),
-    (&["rainbow-breathing"], None, MoboMode::RainbowBreathing),
+    (&["rainbow"], Some(GpuMode::Spectrum), MoboMode::Rainbow),
+    (
+        &["rainbow-breathing"],
+        Some(GpuMode::Spectrum),
+        MoboMode::RainbowBreathing,
+    ),
     (&["comet", "chase-fade"], None, MoboMode::ChaseFade),
     (
         &["flash-and-dash", "spectrum-chase-fade"],
@@ -58,10 +62,10 @@ const EFFECTS: [(&[&str], Option<GpuMode>, MoboMode); 13] = [
     ),
     (&["chase"], None, MoboMode::Chase),
     (&["spectrum-chase"], None, MoboMode::SpectrumChase),
-    (&["wave"], None, MoboMode::Wave),
+    (&["wave"], Some(GpuMode::Spectrum), MoboMode::Wave),
     (
         &["glowing-yoyo", "rainbow-pulse"],
-        None,
+        Some(GpuMode::Spectrum),
         MoboMode::RainbowPulse,
     ),
     (
@@ -155,11 +159,14 @@ fn plan_effect(
         find_effect(mode).ok_or_else(|| format!("Unknown effect '{mode}'"))?;
     let mut plan = Plan::default();
     if target.gpu() {
-        let fallback = gpu_mode.is_none();
-        if fallback {
-            plan.notes.push(format!(
+        match gpu_mode {
+            None => plan.notes.push(format!(
                 "GPU has no '{name}' effect; it shows static color instead (GPU effects: static, breathing, strobing, color-cycle)."
-            ));
+            )),
+            Some(GpuMode::Spectrum) if name != "color-cycle" => plan.notes.push(format!(
+                "GPU has no '{name}' effect; it runs its color cycle (spectrum) instead."
+            )),
+            Some(_) => {}
         }
         if speed.is_some() {
             plan.notes.push(
@@ -1308,15 +1315,29 @@ mod tests {
         );
         assert_eq!(plan.notes.len(), 1); // speed ignored on GPU
 
-        let wave = plan_effect(Target::All, "wave", None, None).unwrap();
+        // Effects without any GPU equivalent fall back to static color...
+        let flicker = plan_effect(Target::All, "starry-night", None, None).unwrap();
         assert_eq!(
-            wave.gpu,
+            flicker.gpu,
             Some(GpuOp {
                 mode: GpuMode::Static,
                 color: None
             })
         );
-        assert!(wave.notes[0].contains("no 'wave' effect"));
+        assert!(flicker.notes[0].contains("no 'starry-night' effect"));
+        // ...while rainbow-style effects use the GPU's color cycle, with no color needed.
+        for name in ["rainbow", "rainbow-breathing", "wave", "rainbow-pulse"] {
+            let plan = plan_effect(Target::All, name, None, None).unwrap();
+            assert_eq!(
+                plan.gpu,
+                Some(GpuOp {
+                    mode: GpuMode::Spectrum,
+                    color: None
+                }),
+                "{name}"
+            );
+            assert!(plan.notes[0].contains("color cycle (spectrum)"), "{name}");
+        }
 
         assert!(plan_effect(Target::Gpu, "disco", None, None).is_err());
         assert_eq!(
@@ -1501,7 +1522,7 @@ mod tests {
         );
         assert_eq!(result["isError"], false);
         let body = &result["structuredContent"];
-        assert_eq!(body["applied"]["gpu"]["mode"], "static");
+        assert_eq!(body["applied"]["gpu"]["mode"], "spectrum");
         assert_eq!(
             body["applied"]["motherboard"],
             json!({"mode": "wave", "speed": 3, "color": "00ffcc"})
@@ -1509,7 +1530,7 @@ mod tests {
         assert!(body["notes"][0]
             .as_str()
             .unwrap()
-            .contains("static color instead"));
+            .contains("color cycle (spectrum)"));
 
         let status = tool(&mut server, "lumina_get_status", json!({}));
         assert_eq!(status["structuredContent"]["connected"], true);

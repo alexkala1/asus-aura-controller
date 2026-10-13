@@ -58,7 +58,7 @@ Always start with `--dry-run`: it exercises the same code paths, opens no device
 ./target/release/luminactl --dry-run all --off
 ```
 
-For live control drop `--dry-run` (the motherboard needs root; see below). `--off` beats color and mode. GPU and motherboard modes default to static; motherboard speed is 0–4 where 0 is fastest. `all` needs `--color` unless `--off` is given. Modes the GPU lacks fall back to static GPU color, and non-static motherboard modes keep the existing effect colors. Dry-run `status` prints canned values, not live readings.
+For live control drop `--dry-run` (the motherboard needs root; see below). `--off` beats color and mode. GPU and motherboard modes default to static; motherboard speed is 0–4 where 0 is fastest. `--color` is required only for static mode: `all --mode rainbow` (also `rainbow-breathing`, `wave`, `rainbow-pulse`, `spectrum`, `starry-night`, ...) runs without one. With a color, color-driven motherboard effects (`breathing`, `flashing`, `chase`, `chase-fade`) store it as their effect color; effects that generate their own colors ignore it. The GPU's only autonomous effect is its color cycle (spectrum), so `rainbow`, `rainbow-breathing`, `wave` and `rainbow-pulse` run it there (`gpu --mode rainbow` is an alias); effects with no GPU equivalent fall back to static GPU color. Dry-run `status` prints canned values, not live readings.
 
 ### Web Studio
 
@@ -96,7 +96,7 @@ Within one server, baselines are kept per device. A device joins an agent patter
 | --- | --- | --- |
 | `lumina_get_status` | none | Device state, firmware, active agent hold. Motherboard `zones` report the active color buffer (`color_source`: `direct` or `effect`), i.e. the configured color, not a sample of a running animation. A device that cannot be opened reports `{"error": ...}` instead of failing the call. |
 | `lumina_set_color` | `color`, `target` (`all`/`gpu`/`mobo`), `zone` (0–4, motherboard only) | |
-| `lumina_set_effect` | `mode`, `color?`, `target?`, `speed?` (0–4, motherboard only) | The GPU supports static, breathing, strobing, color-cycle. Other modes fall back to static GPU color and the response `notes` say so. |
+| `lumina_set_effect` | `mode`, `color?`, `target?`, `speed?` (0–4, motherboard only) | The GPU supports static, breathing, strobing, color-cycle; `rainbow`, `rainbow-breathing`, `wave` and `rainbow-pulse` run its color cycle. Other modes fall back to static GPU color. The response `notes` say which. |
 | `lumina_turn_off` | `target?` | |
 | `lumina_agent_state` | `state` (`working`/`reviewing`/`success`/`failure`/`idle`), `duration_seconds?` | working = amber breathe, reviewing = cyan wave (GPU holds static cyan), success = green pulse, failure = red strobe. The previous lighting is saved and restored on `idle`, after 3 s for success/failure, or after 15 min for working/reviewing. An explicit set or off call cancels the hold. |
 

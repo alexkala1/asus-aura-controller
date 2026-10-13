@@ -152,8 +152,10 @@ fn invalid_all_mode_is_a_clap_error_before_device_access() {
 fn ignored_motherboard_color_warns_once_and_preserves_stdout() {
     let output = dry_run(&["mobo", "--color", "112233", "--mode", "wave"]);
     assert!(output.status.success());
-    assert_eq!(String::from_utf8(output.stderr).unwrap(),
-        "warning: --color is ignored for effect modes; motherboard effects keep their stored colors\n");
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "warning: --color is ignored for effect modes that generate their own colors\n"
+    );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         successful_stdout(&["mobo", "--mode", "wave"])
@@ -238,4 +240,93 @@ fn all_autonomous_effects_leave_direct_mode_and_do_not_claim_the_color() {
     );
     assert!(stdout.contains("generates its own colors"));
     assert!(!stdout.contains("Synchronized"));
+}
+
+fn gpu_writes(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("[DRY-RUN] GPU Write: Reg "))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn all_rainbow_needs_no_color_and_runs_gpu_spectrum_plus_mobo_rainbow() {
+    let stdout = successful_stdout(&["all", "--mode", "rainbow"]);
+    // GPU: mode register = 4 (spectrum), applied; no color registers touched.
+    assert_eq!(gpu_writes(&stdout), ["0x07 <= 0x04", "0x0e <= 0x01"]);
+    // Motherboard: leave direct mode, select rainbow (5), apply; no color buffer writes.
+    assert_eq!(
+        mobo_writes(&stdout),
+        [
+            "0x8020 <= 0x00",
+            "0x8021 <= 0x05",
+            "0x8022 <= 0x00",
+            "0x8023 <= 0x00",
+            "0x80a0 <= 0x01"
+        ]
+    );
+    assert!(stdout.contains("GPU mode spectrum; motherboard mode rainbow"));
+}
+
+#[test]
+fn all_static_without_color_fails_before_touching_a_device() {
+    let output = dry_run(&["all"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--color is required for static mode"));
+    assert!(output.stdout.is_empty(), "no register may be written");
+}
+
+#[test]
+fn gpu_rainbow_is_the_spectrum_mode() {
+    let stdout = successful_stdout(&["gpu", "--mode", "rainbow"]);
+    assert_eq!(gpu_writes(&stdout), ["0x07 <= 0x04", "0x0e <= 0x01"]);
+}
+
+#[test]
+fn mobo_color_with_a_color_driven_effect_writes_the_effect_buffer() {
+    let output = dry_run(&[
+        "mobo",
+        "--color",
+        "112233",
+        "--mode",
+        "breathing",
+        "--speed",
+        "2",
+    ]);
+    assert!(output.status.success());
+    assert!(
+        output.stderr.is_empty(),
+        "the color is applied, so nothing to warn about"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut expected = vec!["0x8020 <= 0x00".to_owned()];
+    for led in 0..5u16 {
+        for (offset, byte) in ["0x11", "0x33", "0x22"].iter().enumerate() {
+            expected.push(format!(
+                "0x{:04x} <= {byte}",
+                0x8010 + 3 * led + offset as u16
+            ));
+        }
+    }
+    expected.extend(
+        [
+            "0x8021 <= 0x02",
+            "0x8022 <= 0x02",
+            "0x8023 <= 0x00",
+            "0x80a0 <= 0x01",
+        ]
+        .map(str::to_owned),
+    );
+    assert_eq!(mobo_writes(&stdout), expected);
+    assert!(stdout.contains("Mode set to breathing with color #112233 (Speed: 2)"));
+}
+
+#[test]
+fn mobo_color_with_an_autonomous_effect_warns_and_keeps_stored_colors() {
+    let output = dry_run(&["mobo", "--color", "112233", "--mode", "rainbow"]);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--color is ignored"));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(!mobo_writes(&stdout).iter().any(|w| w.starts_with("0x8010")));
 }

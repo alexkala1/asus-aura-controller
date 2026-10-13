@@ -526,3 +526,29 @@ fn many_queued_replies_drain_in_order_after_eof() {
     }
     assert!(client.wait_exit(Duration::from_secs(5)).success());
 }
+
+#[test]
+fn rainbow_effect_without_a_color_puts_gpu_in_spectrum_and_mobo_in_rainbow() {
+    let mut client = Client::start();
+    let result = client.tool("lumina_set_effect", json!({"mode": "rainbow"}));
+    assert_eq!(result["isError"], false, "{result}");
+    let body = &result["structuredContent"];
+    assert_eq!(body["applied"]["gpu"]["mode"], "spectrum");
+    assert_eq!(body["applied"]["motherboard"]["mode"], "rainbow");
+    assert!(body["notes"][0]
+        .as_str()
+        .unwrap()
+        .contains("color cycle (spectrum)"));
+    let (status, stderr) = client.finish();
+    assert!(status.success());
+    // GPU mode register 0x07 = 4 (spectrum); mobo mode register 0x8021 = 5 (rainbow).
+    assert!(stderr.contains("GPU Write: Reg 0x07 <= 0x04"), "{stderr}");
+    assert!(
+        stderr.contains("Mobo Write: Reg 0x8021 <= 0x05"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("Reg 0x04 <="),
+        "no GPU color register without a color"
+    );
+}
