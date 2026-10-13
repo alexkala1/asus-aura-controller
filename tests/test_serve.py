@@ -15,7 +15,7 @@ WEB = Path(__file__).resolve().parents[1] / "web"
 
 @pytest.fixture
 def server_module(monkeypatch):
-    spec = importlib.util.spec_from_file_location("aura_web_server_sock", WEB / "serve.py")
+    spec = importlib.util.spec_from_file_location("lumina_web_server_sock", WEB / "serve.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     module.calls = []
@@ -34,7 +34,7 @@ def start(server_module):
 
     def _start(max_active=16):
         httpd = server_module.BoundedThreadingServer(
-            ("127.0.0.1", 0), server_module.AuraRequestHandler, max_active=max_active)
+            ("127.0.0.1", 0), server_module.LuminaRequestHandler, max_active=max_active)
         threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
         servers.append(httpd)
         return httpd.server_address[1]
@@ -126,7 +126,7 @@ def test_a_stalled_body_does_not_block_other_clients(start, server_module):
 
 
 def test_incomplete_headers_time_out_and_do_not_block_others(start, server_module, monkeypatch):
-    monkeypatch.setattr(server_module.AuraRequestHandler, "timeout", 0.4)
+    monkeypatch.setattr(server_module.LuminaRequestHandler, "timeout", 0.4)
     port = start()
     stalled = socket.create_connection(("127.0.0.1", port))
     stalled.sendall(b"POST /api/apply HTTP/1.1\r\nHos")
@@ -139,7 +139,7 @@ def test_incomplete_headers_time_out_and_do_not_block_others(start, server_modul
 
 def test_a_stalled_body_times_out_with_408(start, server_module, monkeypatch):
     monkeypatch.setattr(server_module, "IO_TIMEOUT", 0.4)
-    monkeypatch.setattr(server_module.AuraRequestHandler, "timeout", 0.4)
+    monkeypatch.setattr(server_module.LuminaRequestHandler, "timeout", 0.4)
     port = start()
     started = time.monotonic()
     response = exchange(port, post("Content-Length: 100\r\n", b"{"), timeout=4)
@@ -161,3 +161,32 @@ def test_connection_cap_returns_503_instead_of_queueing(start, server_module):
     time.sleep(0.3)
     ok = exchange(port, b"GET /favicon.svg HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
     assert status_of(ok) == 200
+
+
+def load_with_env(monkeypatch, **env):
+    for name in ("LUMINA_CLI_BIN", "AURA_CLI_BIN", "LUMINA_PORT", "AURA_PORT"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    spec = importlib.util.spec_from_file_location("lumina_web_server_env", WEB / "serve.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_lumina_environment_names_win_and_legacy_names_still_work(monkeypatch):
+    default = load_with_env(monkeypatch)
+    assert default.CLI_BIN.name == "luminactl"
+    assert default.PORT == 7890
+    legacy = load_with_env(monkeypatch, AURA_CLI_BIN="/opt/old/bin", AURA_PORT="7001")
+    assert str(legacy.CLI_BIN) == "/opt/old/bin" and legacy.PORT == 7001
+    both = load_with_env(monkeypatch, LUMINA_CLI_BIN="/opt/new/bin", AURA_CLI_BIN="/opt/old/bin",
+                         LUMINA_PORT="7002", AURA_PORT="7001")
+    assert str(both.CLI_BIN) == "/opt/new/bin" and both.PORT == 7002
+
+
+def test_legacy_handler_name_is_an_alias_and_logs_use_the_lumina_prefix(server_module, capsys):
+    assert server_module.AuraRequestHandler is server_module.LuminaRequestHandler
+    handler = object.__new__(server_module.LuminaRequestHandler)
+    handler.log_message("%s", "hello")
+    assert capsys.readouterr().err == "[lumina-server] hello\n"

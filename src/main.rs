@@ -12,7 +12,10 @@ use protocol::{parse_hex_color, GpuMode, MoboMode, GPU_I2C_DEV};
 use std::io::{self, Write};
 
 #[derive(Debug, Parser)]
-#[command(about = "ASUS Aura Sync Hardware RGB Controller for Linux")]
+#[command(
+    name = "luminactl",
+    about = "Pure Linux RGB lighting controller — reverse-engineered for ASUS Aura Sync hardware"
+)]
 pub struct Cli {
     #[arg(long, global = true)]
     dry_run: bool,
@@ -110,7 +113,7 @@ fn mobo_controller(dry_run: bool) -> Result<MoboController<Box<dyn PortIo>>, Str
 
 fn human_status(gpu: &GpuStatus, mobo: &MoboStatus) -> String {
     let mut text = format!(
-        "==================================================\n  ASUS Aura Hardware Status (Live)\n==================================================\n[GPU]  {}\n       Bus: {} @ {} (Magic 0x1589 Verified)\n       Mode: {}, Color: #{}\n--------------------------------------------------\n[MOBO] {}\n       Super I/O Port: {} @ {} ({} Verified)\n       Mode: {}, Speed: {}, Direction: {}\n",
+        "==================================================\n  Lumina Hardware Status (Live)\n==================================================\n[GPU]  {}\n       Bus: {} @ {} (Magic 0x1589 Verified)\n       Mode: {}, Color: #{}\n--------------------------------------------------\n[MOBO] {}\n       Super I/O Port: {} @ {} ({} Verified)\n       Mode: {}, Speed: {}, Direction: {}\n",
         gpu.device, gpu.bus, gpu.address, gpu.mode, gpu.color_hex, mobo.device,
         mobo.smbus_port, mobo.slave_address, mobo.firmware, mobo.mode, mobo.speed, mobo.direction
     );
@@ -253,21 +256,28 @@ mod cli_tests {
     #[test]
     fn accepts_commands_flags_and_mode_spellings() {
         for args in [
-            vec!["aura", "--dry-run", "--json", "status"],
-            vec!["aura", "status", "--json", "--dry-run"],
-            vec!["aura", "gpu", "--color", "#FF0055", "--mode", "breathing"],
+            vec!["luminactl", "--dry-run", "--json", "status"],
+            vec!["luminactl", "status", "--json", "--dry-run"],
             vec![
-                "aura",
+                "luminactl",
+                "gpu",
+                "--color",
+                "#FF0055",
+                "--mode",
+                "breathing",
+            ],
+            vec![
+                "luminactl",
                 "mobo",
                 "--mode",
                 "rainbow_breathing",
                 "--speed",
                 "4",
             ],
-            vec!["aura", "mobo", "--mode", "rainbow-breathing"],
-            vec!["aura", "all", "--off"],
-            vec!["aura", "all", "--color", "112233", "--mode", "rainbow"],
-            vec!["aura", "--dry-run", "mcp"],
+            vec!["luminactl", "mobo", "--mode", "rainbow-breathing"],
+            vec!["luminactl", "all", "--off"],
+            vec!["luminactl", "all", "--color", "112233", "--mode", "rainbow"],
+            vec!["luminactl", "--dry-run", "mcp"],
         ] {
             assert!(Cli::try_parse_from(args).is_ok());
         }
@@ -276,13 +286,13 @@ mod cli_tests {
     #[test]
     fn rejects_invalid_arguments() {
         for args in [
-            vec!["aura"],
-            vec!["aura", "all"],
-            vec!["aura", "mobo", "--speed", "5"],
-            vec!["aura", "mobo", "--speed", "-1"],
-            vec!["aura", "gpu", "--mode", "rainbow"],
-            vec!["aura", "mobo", "--mode", "invalid"],
-            vec!["aura", "all", "--color", "112233", "--mode", "invalid"],
+            vec!["luminactl"],
+            vec!["luminactl", "all"],
+            vec!["luminactl", "mobo", "--speed", "5"],
+            vec!["luminactl", "mobo", "--speed", "-1"],
+            vec!["luminactl", "gpu", "--mode", "rainbow"],
+            vec!["luminactl", "mobo", "--mode", "invalid"],
+            vec!["luminactl", "all", "--color", "112233", "--mode", "invalid"],
         ] {
             assert!(Cli::try_parse_from(args).is_err());
         }
@@ -291,20 +301,20 @@ mod cli_tests {
     #[test]
     fn bad_color_is_reported_before_device_access() {
         for cmd in ["gpu", "mobo", "all"] {
-            let cli = Cli::try_parse_from(["aura", cmd, "--color", "zzz"]).unwrap();
+            let cli = Cli::try_parse_from(["luminactl", cmd, "--color", "zzz"]).unwrap();
             assert!(run(cli).unwrap_err().contains("6 hexadecimal digits"));
         }
     }
 
     #[test]
     fn json_status_is_clean_and_human_status_has_zones() {
-        let cli = Cli::try_parse_from(["aura", "--dry-run", "status", "--json"]).unwrap();
+        let cli = Cli::try_parse_from(["luminactl", "--dry-run", "status", "--json"]).unwrap();
         let data: serde_json::Value = serde_json::from_str(&run(cli).unwrap()).unwrap();
         assert_eq!(data["gpu"]["magic_verified"], true);
         assert_eq!(data["motherboard"]["led_count"], 5);
-        let cli = Cli::try_parse_from(["aura", "--dry-run", "status"]).unwrap();
+        let cli = Cli::try_parse_from(["luminactl", "--dry-run", "status"]).unwrap();
         let text = run(cli).unwrap();
-        assert!(text.contains("ASUS Aura Hardware Status (Live)"));
+        assert!(text.contains("Lumina Hardware Status (Live)"));
         assert!(text.contains("LED 4 (RGB Header 1): #000000"));
     }
 
@@ -345,7 +355,7 @@ mod cli_tests {
                 "[ALL] GPU set to #112233 (Mode: static); motherboard effect rainbow_breathing generates its own colors.",
             ),
         ] {
-            let cli = Cli::try_parse_from(["aura", "--dry-run"].into_iter().chain(args)).unwrap();
+            let cli = Cli::try_parse_from(["luminactl", "--dry-run"].into_iter().chain(args)).unwrap();
             assert_eq!(run(cli).unwrap(), expected);
         }
     }

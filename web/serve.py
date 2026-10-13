@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Local HTTP API server for ASUS Aura Lighting Studio.
-Provides static asset serving and live hardware endpoints calling asus-aura-cli.
+"""Local HTTP API server for Lumina Lighting Studio.
+Provides static asset serving and live hardware endpoints calling luminactl.
 """
 import http.server
 import json
@@ -17,8 +17,12 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parent.parent
 WEB_DIR = ROOT_DIR / "web"
 # sudo rules must point at a root-owned binary (see SECURITY.md), so allow an override.
-CLI_BIN = Path(os.environ.get("AURA_CLI_BIN", ROOT_DIR / "target" / "release" / "asus-aura-cli"))
-PORT = int(os.environ.get("AURA_PORT", 7890))
+CLI_BIN = Path(
+    os.environ.get("LUMINA_CLI_BIN")
+    or os.environ.get("AURA_CLI_BIN")  # legacy name
+    or ROOT_DIR / "target" / "release" / "luminactl"
+)
+PORT = int(os.environ.get("LUMINA_PORT") or os.environ.get("AURA_PORT") or 7890)
 
 MAX_BODY_BYTES = 16 * 1024      # an apply request is a few hundred bytes
 IO_TIMEOUT = 10.0               # per socket read; also bounds the whole body read
@@ -33,7 +37,7 @@ class RequestError(Exception):
         self.message = message
 
 
-class AuraRequestHandler(http.server.SimpleHTTPRequestHandler):
+class LuminaRequestHandler(http.server.SimpleHTTPRequestHandler):
     timeout = IO_TIMEOUT  # StreamRequestHandler applies this to the connection socket
 
     def __init__(self, *args, **kwargs):
@@ -91,7 +95,7 @@ class AuraRequestHandler(http.server.SimpleHTTPRequestHandler):
             raise RequestError(400, f"Invalid JSON: {e}")
 
     def log_message(self, format, *args):
-        sys.stderr.write(f"[aura-server] {format % args}\n")
+        sys.stderr.write(f"[lumina-server] {format % args}\n")
 
     def do_GET(self):
         if self.path == "/api/status":
@@ -163,7 +167,7 @@ class AuraRequestHandler(http.server.SimpleHTTPRequestHandler):
                 cmd.extend(["--speed", str(speed)])
 
         cmd_display = " ".join(shlex.quote(c) for c in cmd)
-        print(f"[aura-server] Executing: {cmd_display}", flush=True)
+        print(f"[lumina-server] Executing: {cmd_display}", flush=True)
 
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
@@ -227,9 +231,13 @@ class BoundedThreadingServer(http.server.ThreadingHTTPServer):
             self._slots.release()
 
 
+# Legacy name kept for importers.
+AuraRequestHandler = LuminaRequestHandler
+
+
 def run_server():
-    with BoundedThreadingServer(("127.0.0.1", PORT), AuraRequestHandler) as httpd:
-        print(f"[aura-server] Serving on http://127.0.0.1:{PORT} (Press Ctrl+C to stop)", flush=True)
+    with BoundedThreadingServer(("127.0.0.1", PORT), LuminaRequestHandler) as httpd:
+        print(f"[lumina-server] Serving on http://127.0.0.1:{PORT} (Press Ctrl+C to stop)", flush=True)
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:

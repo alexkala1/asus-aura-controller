@@ -1,5 +1,7 @@
 # ASUS Aura Sync Reverse Engineering Analysis (REA) Dossier
 
+> luminactl is an independent project, not affiliated with or endorsed by ASUSTeK Computer Inc. "ASUS", "Aura Sync" and "ROG" are ASUSTeK trademarks used only to describe the hardware protocols analyzed here. Register names such as `AURA_GPU_REG_*` are quoted from the analyzed vendor interfaces.
+
 ## 1. Upstream Binary Provenance & Triage
 
 * **Source Package**: Official ASUS CDN Standalone Lighting Control Utility  
@@ -123,5 +125,5 @@ Using REA (`inspect_managed_artifact`, `open_binary`, `binary_session`):
 2. **Super I/O Port Locking**:
    On Linux, communicating with `0x02c0` requires raw port access (`/dev/port` with root/sudo or `iopl(3)` / `ioperm(3)`). Direct port access via `/dev/port` provides an immediate, zero-compilation user-space driver.
 3. **Reference Controller Verification**:
-   The standalone tool [aura_ctl.py](aura_ctl.py) implements both the GPU and Motherboard protocols, with safety signature verification and comprehensive unit tests.
+   The standalone tool [lumina_ctl.py](lumina_ctl.py) implements both the GPU and Motherboard protocols, with safety signature verification and comprehensive unit tests.
 

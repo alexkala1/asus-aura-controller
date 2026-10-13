@@ -17,7 +17,7 @@ fn acquire_with_timeout(file: &File, path: &str, timeout: Duration) -> io::Resul
                 if remaining.is_zero() {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        format!("timed out waiting for exclusive access to {path} (another asus-aura-cli process is using it)"),
+                        format!("timed out waiting for exclusive access to {path} (another luminactl process is using it)"),
                     ));
                 }
                 std::thread::sleep(remaining.min(Duration::from_millis(25)));
@@ -61,7 +61,7 @@ mod tests {
         assert!(error.to_string().contains(path_str));
         assert!(error
             .to_string()
-            .contains("another asus-aura-cli process is using it"));
+            .contains("another luminactl process is using it"));
         drop(first);
         acquire_with_timeout(&second, path_str, timeout).unwrap();
         drop(second);

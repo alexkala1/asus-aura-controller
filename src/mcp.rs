@@ -1,4 +1,4 @@
-//! MCP server (`asus-aura-cli mcp`): newline-delimited JSON-RPC 2.0 over stdio.
+//! MCP server (`luminactl mcp`): newline-delimited JSON-RPC 2.0 over stdio.
 //!
 //! stdout carries protocol messages only; every diagnostic goes to stderr.
 
@@ -404,13 +404,13 @@ fn tool_catalog() -> Value {
     let effect_names: Vec<&str> = EFFECTS.iter().map(|(names, ..)| names[0]).collect();
     json!([
         {
-            "name": "aura_get_status",
+            "name": "lumina_get_status",
             "description": "Read GPU and motherboard lighting state (mode, colors, firmware) and any active agent-state hold. Read-only.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
             "annotations": {"readOnlyHint": true, "openWorldHint": false}
         },
         {
-            "name": "aura_set_color",
+            "name": "lumina_set_color",
             "description": "Set a static RGB color. Motherboard writes color every onboard LED unless `zone` is given.",
             "inputSchema": {
                 "type": "object",
@@ -425,7 +425,7 @@ fn tool_catalog() -> Value {
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
         },
         {
-            "name": "aura_set_effect",
+            "name": "lumina_set_effect",
             "description": "Apply a lighting effect. The GPU supports static, breathing, strobing and color-cycle only; other effects fall back to static GPU color and the response says so.",
             "inputSchema": {
                 "type": "object",
@@ -441,13 +441,13 @@ fn tool_catalog() -> Value {
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
         },
         {
-            "name": "aura_turn_off",
+            "name": "lumina_turn_off",
             "description": "Turn LEDs off.",
             "inputSchema": {"type": "object", "properties": {"target": target("Default all.")}, "additionalProperties": false},
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
         },
         {
-            "name": "aura_agent_state",
+            "name": "lumina_agent_state",
             "description": "Show an agent state on the case LEDs: working = amber breathe, reviewing = cyan wave (GPU holds static cyan), success = green pulse, failure = red strobe, idle = restore the lighting that was set before. success/failure revert on their own after 3s; working/reviewing after 15 min unless `duration_seconds` is given.",
             "inputSchema": {
                 "type": "object",
@@ -485,7 +485,7 @@ fn topology() -> Value {
                 {"zone": 2, "channel": "Back I/O"}, {"zone": 3, "channel": "Back I/O"},
                 {"zone": 4, "channel": "RGB Header 1"}
             ],
-            "zone_note": "Default mapping; aura://state/current reports the channels read from firmware.",
+            "zone_note": "Default mapping; lumina://state/current reports the channels read from firmware.",
             "effects": EFFECTS.iter().map(|(names, ..)| names[0]).collect::<Vec<_>>(),
             "speed": "0 (fastest) to 4 (slowest)"
         },
@@ -610,25 +610,29 @@ impl Server {
                 Ok(json!({
                     "protocolVersion": version,
                     "capabilities": {"tools": {"listChanged": false}, "resources": {"subscribe": false, "listChanged": false}},
-                    "serverInfo": {"name": "asus-aura", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": "Controls ASUS Aura RGB on this host. Prefer aura_agent_state for status signalling; it restores the user's lighting on idle."
+                    "serverInfo": {"name": "luminactl", "version": env!("CARGO_PKG_VERSION")},
+                    "instructions": "Controls Lumina RGB lighting on this host (reverse-engineered for ASUS Aura Sync hardware). Prefer lumina_agent_state for status signalling; it restores the user's lighting on idle."
                 }))
             }
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({"tools": tool_catalog()})),
             "tools/call" => self.call_tool(params),
             "resources/list" => Ok(json!({"resources": [
-                {"uri": "aura://hardware/topology", "name": "Hardware topology", "description": "Buses, addresses, zones and supported effects", "mimeType": "application/json"},
-                {"uri": "aura://state/current", "name": "Current lighting state", "description": "Live device state and active agent hold", "mimeType": "application/json"}
+                {"uri": "lumina://hardware/topology", "name": "Hardware topology", "description": "Buses, addresses, zones and supported effects", "mimeType": "application/json"},
+                {"uri": "lumina://state/current", "name": "Current lighting state", "description": "Live device state and active agent hold", "mimeType": "application/json"}
             ]})),
             "resources/read" => {
                 let uri = params
                     .get("uri")
                     .and_then(Value::as_str)
                     .ok_or((-32602, "Missing `uri`".to_owned()))?;
-                let body = match uri {
-                    "aura://hardware/topology" => topology(),
-                    "aura://state/current" => self.status(),
+                // `aura://` is the legacy spelling of the same resources.
+                let canonical = uri
+                    .strip_prefix("aura://")
+                    .map(|rest| format!("lumina://{rest}"));
+                let body = match canonical.as_deref().unwrap_or(uri) {
+                    "lumina://hardware/topology" => topology(),
+                    "lumina://state/current" => self.status(),
                     _ => return Err((-32002, format!("Resource not found: {uri}"))),
                 };
                 Ok(
@@ -650,22 +654,27 @@ impl Server {
             Some(Value::Object(map)) => map,
             Some(_) => return Err((-32602, "`arguments` must be an object".to_owned())),
         };
+        // Legacy `aura_*` names stay accepted as aliases of the canonical `lumina_*` tools.
+        let canonical = name
+            .strip_prefix("aura_")
+            .map(|rest| format!("lumina_{rest}"));
+        let name = canonical.as_deref().unwrap_or(name);
         if ![
-            "aura_get_status",
-            "aura_set_color",
-            "aura_set_effect",
-            "aura_turn_off",
-            "aura_agent_state",
+            "lumina_get_status",
+            "lumina_set_color",
+            "lumina_set_effect",
+            "lumina_turn_off",
+            "lumina_agent_state",
         ]
         .contains(&name)
         {
             return Err((-32602, format!("Unknown tool: {name}")));
         }
         let outcome = match name {
-            "aura_get_status" => reject_unknown(args, &[]).map(|()| (self.status(), false)),
-            "aura_set_color" => self.set_color(args),
-            "aura_set_effect" => self.set_effect(args),
-            "aura_turn_off" => self.turn_off(args),
+            "lumina_get_status" => reject_unknown(args, &[]).map(|()| (self.status(), false)),
+            "lumina_set_color" => self.set_color(args),
+            "lumina_set_effect" => self.set_effect(args),
+            "lumina_turn_off" => self.turn_off(args),
             _ => self.agent_state(args),
         };
         Ok(match outcome {
@@ -923,7 +932,7 @@ impl Server {
                         hold.gpu = Some(device);
                     } else {
                         crate::diag::log(&format!(
-                            "asus-aura mcp: giving up gpu baseline restore after {MAX_RESTORE_ATTEMPTS} attempts: {e}"
+                            "luminactl mcp: giving up gpu baseline restore after {MAX_RESTORE_ATTEMPTS} attempts: {e}"
                         ));
                     }
                 }
@@ -947,7 +956,7 @@ impl Server {
                         hold.mobo = Some(device);
                     } else {
                         crate::diag::log(&format!(
-                            "asus-aura mcp: giving up motherboard baseline restore after {MAX_RESTORE_ATTEMPTS} attempts: {e}"
+                            "luminactl mcp: giving up motherboard baseline restore after {MAX_RESTORE_ATTEMPTS} attempts: {e}"
                         ));
                     }
                 }
@@ -969,7 +978,7 @@ impl Server {
         if self.hold.as_ref().is_some_and(|h| h.deadline <= now) {
             for failure in self.restore_baseline().failed {
                 crate::diag::log(&format!(
-                    "asus-aura mcp: baseline restore failed: {failure}"
+                    "luminactl mcp: baseline restore failed: {failure}"
                 ));
             }
         }
@@ -1128,7 +1137,7 @@ fn run_loop(
 ) -> Result<(), String> {
     loop {
         if stop.load(Ordering::Relaxed) {
-            crate::diag::log("asus-aura mcp: shutdown signal received");
+            crate::diag::log("luminactl mcp: shutdown signal received");
             return Ok(());
         }
         if let Some(error) = out.failure() {
@@ -1161,7 +1170,7 @@ fn run_loop(
 fn shutdown_cleanup(server: &mut Server) {
     for failure in server.restore_baseline().failed {
         crate::diag::log(&format!(
-            "asus-aura mcp: baseline restore failed: {failure}"
+            "luminactl mcp: baseline restore failed: {failure}"
         ));
     }
     while server.hold.is_some() {
@@ -1186,16 +1195,16 @@ pub fn serve(dry_run: bool) -> Result<(), String> {
     // Blocking reads live on their own thread so the loop can fire revert timers.
     std::thread::spawn(move || {
         if let Err(error) = read_input(io::stdin().lock(), tx) {
-            crate::diag::log(&format!("asus-aura mcp: input error: {error}"));
+            crate::diag::log(&format!("luminactl mcp: input error: {error}"));
         }
     });
     let out = Output::spawn(io::stdout());
     let outcome = run_loop(&mut server, &rx, &out, &SHUTDOWN);
     shutdown_cleanup(&mut server);
     if let Err(error) = &outcome {
-        crate::diag::log(&format!("asus-aura mcp: ending session: {error}"));
+        crate::diag::log(&format!("luminactl mcp: ending session: {error}"));
     } else {
-        crate::diag::log("asus-aura mcp: clean shutdown");
+        crate::diag::log("luminactl mcp: clean shutdown");
     }
     crate::diag::flush(Duration::from_millis(500));
     outcome
@@ -1358,7 +1367,7 @@ mod tests {
         );
         let unknown = call(
             &mut server,
-            json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "aura_nope"}}),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "lumina_nope"}}),
         );
         assert_eq!(unknown["error"]["code"], -32602);
         let tools = call(
@@ -1373,39 +1382,43 @@ mod tests {
         let mut server = Server::new(true);
         for (name, args, needle) in [
             (
-                "aura_set_color",
+                "lumina_set_color",
                 json!({"color": "zzz"}),
                 "6 hexadecimal digits",
             ),
-            ("aura_set_color", json!({}), "`color` is required"),
+            ("lumina_set_color", json!({}), "`color` is required"),
             (
-                "aura_set_color",
+                "lumina_set_color",
                 json!({"color": "ffffff", "zone": 5}),
                 "0..4",
             ),
             (
-                "aura_set_color",
+                "lumina_set_color",
                 json!({"color": "ffffff", "zone": 1, "target": "gpu"}),
                 "requires target",
             ),
             (
-                "aura_set_effect",
+                "lumina_set_effect",
                 json!({"mode": "wave", "speed": 9}),
                 "0..4",
             ),
             (
-                "aura_set_effect",
+                "lumina_set_effect",
                 json!({"mode": "disco"}),
                 "Unknown effect",
             ),
             (
-                "aura_turn_off",
+                "lumina_turn_off",
                 json!({"target": "fans"}),
                 "all, gpu or mobo",
             ),
-            ("aura_turn_off", json!({"colour": "x"}), "Unknown argument"),
             (
-                "aura_agent_state",
+                "lumina_turn_off",
+                json!({"colour": "x"}),
+                "Unknown argument",
+            ),
+            (
+                "lumina_agent_state",
                 json!({"state": "panic"}),
                 "Unknown state",
             ),
@@ -1427,7 +1440,7 @@ mod tests {
         let mut server = Server::new(true);
         let result = tool(
             &mut server,
-            "aura_set_effect",
+            "lumina_set_effect",
             json!({"mode": "wave", "color": "00ffcc", "speed": 3}),
         );
         assert_eq!(result["isError"], false);
@@ -1442,7 +1455,7 @@ mod tests {
             .unwrap()
             .contains("static color instead"));
 
-        let status = tool(&mut server, "aura_get_status", json!({}));
+        let status = tool(&mut server, "lumina_get_status", json!({}));
         assert_eq!(status["structuredContent"]["connected"], true);
         assert_eq!(status["structuredContent"]["motherboard"]["led_count"], 5);
     }
@@ -1450,19 +1463,23 @@ mod tests {
     #[test]
     fn agent_hold_reverts_on_idle_timeout_and_manual_override() {
         let mut server = Server::new(true);
-        let working = tool(&mut server, "aura_agent_state", json!({"state": "working"}));
+        let working = tool(
+            &mut server,
+            "lumina_agent_state",
+            json!({"state": "working"}),
+        );
         assert_eq!(working["structuredContent"]["pattern"], "amber_breathe");
         assert_eq!(server.hold.as_ref().unwrap().state, "working");
 
         // A later state keeps the first baseline.
         tool(
             &mut server,
-            "aura_agent_state",
+            "lumina_agent_state",
             json!({"state": "success", "duration_seconds": 1}),
         );
         assert_eq!(server.hold.as_ref().unwrap().state, "success");
         assert!(server.hold.as_ref().unwrap().gpu.is_some());
-        let status = tool(&mut server, "aura_get_status", json!({}));
+        let status = tool(&mut server, "lumina_get_status", json!({}));
         assert_eq!(
             status["structuredContent"]["agent_state"]["state"],
             "success"
@@ -1473,14 +1490,22 @@ mod tests {
         server.expire_if_due(Instant::now() + Duration::from_secs(2));
         assert!(server.hold.is_none());
 
-        tool(&mut server, "aura_agent_state", json!({"state": "failure"}));
-        let idle = tool(&mut server, "aura_agent_state", json!({"state": "idle"}));
+        tool(
+            &mut server,
+            "lumina_agent_state",
+            json!({"state": "failure"}),
+        );
+        let idle = tool(&mut server, "lumina_agent_state", json!({"state": "idle"}));
         assert_eq!(idle["structuredContent"]["baseline_restored"], true);
-        let again = tool(&mut server, "aura_agent_state", json!({"state": "idle"}));
+        let again = tool(&mut server, "lumina_agent_state", json!({"state": "idle"}));
         assert_eq!(again["structuredContent"]["baseline_restored"], false);
 
-        tool(&mut server, "aura_agent_state", json!({"state": "working"}));
-        tool(&mut server, "aura_set_color", json!({"color": "112233"}));
+        tool(
+            &mut server,
+            "lumina_agent_state",
+            json!({"state": "working"}),
+        );
+        tool(&mut server, "lumina_set_color", json!({"color": "112233"}));
         assert!(
             server.hold.is_none(),
             "an explicit change supersedes the hold"
@@ -1492,7 +1517,7 @@ mod tests {
     }
 
     fn working(server: &mut Server) {
-        let result = tool(server, "aura_agent_state", json!({"state": "working"}));
+        let result = tool(server, "lumina_agent_state", json!({"state": "working"}));
         assert_eq!(result["isError"], false, "{result}");
     }
 
@@ -1502,13 +1527,13 @@ mod tests {
         working(&mut server);
         let result = tool(
             &mut server,
-            "aura_set_color",
+            "lumina_set_color",
             json!({"target": "gpu", "color": "112233"}),
         );
         assert_eq!(body(&result)["agent_hold_released"], json!(["gpu"]));
         assert!(server.hold.as_ref().unwrap().gpu.is_none());
         assert!(server.hold.as_ref().unwrap().mobo.is_some());
-        let idle = tool(&mut server, "aura_agent_state", json!({"state": "idle"}));
+        let idle = tool(&mut server, "lumina_agent_state", json!({"state": "idle"}));
         assert_eq!(body(&idle)["restored_devices"], json!(["motherboard"]));
         assert_eq!(body(&idle)["not_enrolled"], json!(["gpu"]));
         assert_eq!(
@@ -1525,12 +1550,12 @@ mod tests {
         working(&mut server);
         tool(
             &mut server,
-            "aura_set_color",
+            "lumina_set_color",
             json!({"target": "mobo", "color": "112233"}),
         );
         assert!(server.hold.as_ref().unwrap().gpu.is_some());
         assert!(server.hold.as_ref().unwrap().mobo.is_none());
-        let idle = tool(&mut server, "aura_agent_state", json!({"state": "idle"}));
+        let idle = tool(&mut server, "lumina_agent_state", json!({"state": "idle"}));
         assert_eq!(body(&idle)["restored_devices"], json!(["gpu"]));
         assert_eq!(server.restore_calls, ["gpu"]);
     }
@@ -1540,7 +1565,7 @@ mod tests {
         let mut server = Server::new(true);
         working(&mut server);
         server.faults.push(("apply", "motherboard"));
-        let result = tool(&mut server, "aura_set_color", json!({"color": "112233"}));
+        let result = tool(&mut server, "lumina_set_color", json!({"color": "112233"}));
         assert_eq!(result["isError"], true);
         assert!(body(&result)["applied"]["gpu"].is_object());
         assert!(body(&result)["errors"]["motherboard"].is_string());
@@ -1563,7 +1588,7 @@ mod tests {
         let mut server = Server::new(true);
         working(&mut server);
         server.faults.push(("restore", "motherboard"));
-        let idle = tool(&mut server, "aura_agent_state", json!({"state": "idle"}));
+        let idle = tool(&mut server, "lumina_agent_state", json!({"state": "idle"}));
         assert_eq!(idle["isError"], true);
         assert_eq!(body(&idle)["restored_devices"], json!(["gpu"]));
         let hold = server.hold.as_ref().unwrap();
@@ -1605,7 +1630,11 @@ mod tests {
     fn device_without_a_saved_baseline_is_never_mutated() {
         let mut server = Server::new(true);
         server.faults.push(("snapshot", "gpu"));
-        let result = tool(&mut server, "aura_agent_state", json!({"state": "working"}));
+        let result = tool(
+            &mut server,
+            "lumina_agent_state",
+            json!({"state": "working"}),
+        );
         assert_eq!(result["isError"], false);
         assert!(
             body(&result)["applied"].get("gpu").is_none(),
@@ -1623,7 +1652,7 @@ mod tests {
         server.faults.clear();
         let next = tool(
             &mut server,
-            "aura_agent_state",
+            "lumina_agent_state",
             json!({"state": "reviewing"}),
         );
         assert!(body(&next)["applied"]["gpu"].is_object());
@@ -1631,7 +1660,7 @@ mod tests {
             body(&next)["baseline_devices"],
             json!(["gpu", "motherboard"])
         );
-        let idle = tool(&mut server, "aura_agent_state", json!({"state": "idle"}));
+        let idle = tool(&mut server, "lumina_agent_state", json!({"state": "idle"}));
         assert_eq!(
             body(&idle)["restored_devices"],
             json!(["gpu", "motherboard"])
@@ -1644,10 +1673,14 @@ mod tests {
         server
             .faults
             .extend([("snapshot", "gpu"), ("snapshot", "motherboard")]);
-        let result = tool(&mut server, "aura_agent_state", json!({"state": "working"}));
+        let result = tool(
+            &mut server,
+            "lumina_agent_state",
+            json!({"state": "working"}),
+        );
         assert_eq!(result["isError"], true);
         assert!(server.hold.is_none());
-        let idle = tool(&mut server, "aura_agent_state", json!({"state": "idle"}));
+        let idle = tool(&mut server, "lumina_agent_state", json!({"state": "idle"}));
         assert_eq!(
             body(&idle)["baseline_restored"],
             false,
@@ -1660,13 +1693,61 @@ mod tests {
         server
             .faults
             .extend([("open", "gpu"), ("open", "motherboard")]);
-        let again = tool(&mut server, "aura_agent_state", json!({"state": "success"}));
+        let again = tool(
+            &mut server,
+            "lumina_agent_state",
+            json!({"state": "success"}),
+        );
         assert_eq!(again["isError"], true);
         assert!(
             server.hold.as_ref().unwrap().gpu.is_some(),
             "existing baselines survive"
         );
         assert_eq!(server.hold.as_ref().unwrap().state, "working");
+    }
+
+    #[test]
+    fn legacy_aura_names_alias_the_lumina_tools_and_resources() {
+        let mut server = Server::new(true);
+        let legacy = tool(&mut server, "aura_get_status", json!({}));
+        let canonical = tool(&mut server, "lumina_get_status", json!({}));
+        assert_eq!(legacy["isError"], false);
+        assert_eq!(body(&legacy), body(&canonical));
+        let off = tool(&mut server, "aura_turn_off", json!({"target": "gpu"}));
+        assert_eq!(body(&off)["applied"]["gpu"]["mode"], "off");
+        let tools = call(
+            &mut server,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        );
+        let names: Vec<&str> = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.iter().all(|n| n.starts_with("lumina_")), "{names:?}");
+        let read = call(
+            &mut server,
+            json!({"jsonrpc": "2.0", "id": 2, "method": "resources/read", "params": {"uri": "aura://hardware/topology"}}),
+        );
+        assert_eq!(
+            read["result"]["contents"][0]["uri"],
+            "aura://hardware/topology"
+        );
+        let listed = call(
+            &mut server,
+            json!({"jsonrpc": "2.0", "id": 3, "method": "resources/list"}),
+        );
+        let uris: Vec<&str> = listed["result"]["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["uri"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            uris,
+            ["lumina://hardware/topology", "lumina://state/current"]
+        );
     }
 
     #[test]
@@ -1677,7 +1758,7 @@ mod tests {
             json!({"jsonrpc": "2.0", "id": 1, "method": "resources/list"}),
         );
         assert_eq!(list["result"]["resources"].as_array().unwrap().len(), 2);
-        for uri in ["aura://hardware/topology", "aura://state/current"] {
+        for uri in ["lumina://hardware/topology", "lumina://state/current"] {
             let read = call(
                 &mut server,
                 json!({"jsonrpc": "2.0", "id": 2, "method": "resources/read", "params": {"uri": uri}}),
@@ -1687,7 +1768,7 @@ mod tests {
         }
         let missing = call(
             &mut server,
-            json!({"jsonrpc": "2.0", "id": 3, "method": "resources/read", "params": {"uri": "aura://nope"}}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "resources/read", "params": {"uri": "lumina://nope"}}),
         );
         assert_eq!(missing["error"]["code"], -32002);
     }

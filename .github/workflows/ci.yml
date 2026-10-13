@@ -44,7 +44,7 @@ jobs:
           uv pip install -r requirements-ui.txt
           uv run --no-project python -m playwright install --with-deps chromium
       - run: uv run --no-project pytest tests/test_ui.py tests/test_serve.py
-      - run: python3 -m unittest tests.test_aura
+      - run: python3 -m unittest tests.test_lumina
 
   release-build:
     runs-on: ubuntu-latest
@@ -55,9 +55,9 @@ jobs:
         run: |
           rustup toolchain install "$RUST_VERSION" --profile minimal
           rustup default "$RUST_VERSION"
-      - run: cargo build --release --locked --bin asus-aura-cli
+      - run: cargo build --release --locked --bin luminactl
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: asus-aura-cli-linux-x86_64
-          path: target/release/asus-aura-cli
+          name: luminactl-linux-x86_64
+          path: target/release/luminactl
           if-no-files-found: error

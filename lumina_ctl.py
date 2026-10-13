@@ -35,7 +35,7 @@ def lock_device(fd: int, path: str, timeout: Optional[float] = None,
             if monotonic() >= deadline:
                 raise TimeoutError(
                     f"timed out waiting for exclusive access to {path} "
-                    "(another asus-aura process is using it)")
+                    "(another luminactl process is using it)")
             sleep(0.025)
 
 

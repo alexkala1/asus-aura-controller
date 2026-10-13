@@ -1,7 +1,7 @@
 use std::process::{Command, Output};
 
 fn dry_run(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_asus-aura-cli"))
+    Command::new(env!("CARGO_BIN_EXE_luminactl"))
         .arg("--dry-run")
         .args(args)
         .output()
@@ -139,7 +139,7 @@ fn invalid_speed_is_rejected_before_dispatch() {
 
 #[test]
 fn invalid_all_mode_is_a_clap_error_before_device_access() {
-    let output = Command::new(env!("CARGO_BIN_EXE_asus-aura-cli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_luminactl"))
         .args(["all", "--color", "112233", "--mode", "invalid"])
         .output()
         .unwrap();
@@ -170,7 +170,7 @@ fn dry_run_needs_no_writable_runtime_directory() {
         vec!["mobo", "--off"],
         vec!["all", "--off"],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_asus-aura-cli"))
+        let output = Command::new(env!("CARGO_BIN_EXE_luminactl"))
             .env("XDG_RUNTIME_DIR", &dir)
             .env("TMPDIR", &dir)
             .arg("--dry-run")

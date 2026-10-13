@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "asus-aura": {
-      "command": "sudo",
-      "args": ["-n", "/usr/local/bin/asus-aura-cli", "mcp"]
-    }
-  }
-}

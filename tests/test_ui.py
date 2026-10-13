@@ -89,7 +89,7 @@ def test_live_dashboard(page, daemon, width):
     expect(page.locator("#live-status")).to_have_text("● LIVE")
     expect(page.locator("#daemon-status")).to_have_text("Daemon :7890 · 2 devices detected")
     expect(page.locator(".brand svg")).to_be_visible()
-    expect(page.locator(".brand-wordmark")).to_contain_text("AURA")
+    expect(page.locator(".brand-wordmark")).to_contain_text("LUMINA")
     expect(page.locator("link[rel=icon]")).to_have_attribute("href", "favicon.svg")
     expect(page.locator("#mode-live, #mode-sim")).to_have_count(0)
     expect(page.locator("h1 em")).to_have_count(0)
@@ -111,7 +111,7 @@ def test_live_dashboard(page, daemon, width):
     expect(page.locator("#gpu .hex-value")).to_have_text("#00E5FF")
     assert "rgb(0, 229, 255)" in page.locator("#gpu .preview-wordmark").evaluate("el => getComputedStyle(el).textShadow")
     page.locator("#gpu-mode").select_option("breathing")
-    expect(page.locator("#command-preview")).to_have_text("sudo asus-aura-cli gpu --color 00e5ff --mode breathing")
+    expect(page.locator("#command-preview")).to_have_text("sudo luminactl gpu --color 00e5ff --mode breathing")
     assert daemon["writes"] == []  # Staging never writes hardware.
 
     set_color(page, "#mobo-color", "#112233")
@@ -128,14 +128,14 @@ def test_live_dashboard(page, daemon, width):
     for channel in ["gpu", "mobo"]:
         expect(page.locator(f"#{channel}-color")).to_have_value("#ff0055")
         expect(page.locator(f"#{channel}-mode")).to_have_value("rainbow")
-    expect(page.locator("#command-preview")).to_have_text("sudo asus-aura-cli all --color ff0055 --mode rainbow")
+    expect(page.locator("#command-preview")).to_have_text("sudo luminactl all --color ff0055 --mode rainbow")
     page.locator("#btn-apply").click()
     expect(page.locator("#status-toast")).to_have_text("✓ Applied to hardware.")
     expect(page.locator("#btn-apply")).to_be_enabled()
     assert daemon["writes"] == [{"target": "all", "mode": "rainbow", "color": "ff0055", "speed": 4, "off": False}]
 
     page.locator("#gpu-mode").select_option("off")
-    expect(page.locator("#command-preview")).to_have_text("sudo asus-aura-cli all --off")
+    expect(page.locator("#command-preview")).to_have_text("sudo luminactl all --off")
     page.locator("#btn-apply").click()
     expect(page.locator(".channel-card[data-mode=off]")).to_have_count(2)
     expect(page.locator(".board-map")).to_have_attribute("data-mode", "off")
@@ -350,7 +350,7 @@ def test_board_strip_reads_each_zone_and_unified_color_writes_boardwide(page, da
 
 def test_vector_assets_and_locked_tokens():
     ns = {"svg": "http://www.w3.org/2000/svg"}
-    for filename in ("aura-logo.svg", "favicon.svg"):
+    for filename in ("lumina-logo.svg", "favicon.svg"):
         root = ET.parse(WEB / filename).getroot()
         assert root.attrib["viewBox"] == "0 0 64 64"
         assert [stop.attrib["stop-color"] for stop in root.findall(".//svg:stop", ns)] == ["#ff0055", "#00e5ff"]
@@ -366,7 +366,7 @@ def test_vector_assets_and_locked_tokens():
 
 
 def test_daemon_status_failure_has_no_synthetic_fallback(monkeypatch):
-    spec = importlib.util.spec_from_file_location("aura_web_server", WEB / "serve.py")
+    spec = importlib.util.spec_from_file_location("lumina_web_server", WEB / "serve.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     calls = []
@@ -375,7 +375,7 @@ def test_daemon_status_failure_has_no_synthetic_fallback(monkeypatch):
         calls.append(cmd)
         return SimpleNamespace(returncode=1, stdout="", stderr="Permission denied")
     monkeypatch.setattr(module.subprocess, "run", failed_read)
-    handler = object.__new__(module.AuraRequestHandler)
+    handler = object.__new__(module.LuminaRequestHandler)
     handler.send_json_response = lambda code, body: responses.append((code, body))
     handler.handle_get_status()
     assert len(calls) == 1

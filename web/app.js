@@ -135,7 +135,7 @@ function renderCommand() {
     return;
   }
   const { target, mode, color, speed, off } = selection();
-  const args = ["sudo", "asus-aura-cli", target];
+  const args = ["sudo", "luminactl", target];
   if (off) args.push("--off");
   else {
     args.push("--color", color, "--mode", mode);

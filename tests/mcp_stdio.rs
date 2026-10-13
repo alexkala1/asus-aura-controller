@@ -1,4 +1,4 @@
-//! Drives `asus-aura-cli --dry-run mcp` over real stdio, like an MCP client would.
+//! Drives `luminactl --dry-run mcp` over real stdio, like an MCP client would.
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -24,7 +24,7 @@ struct Client {
 
 impl Client {
     fn start() -> Self {
-        Self::spawn(env!("CARGO_BIN_EXE_asus-aura-cli"), &["--dry-run", "mcp"])
+        Self::spawn(env!("CARGO_BIN_EXE_luminactl"), &["--dry-run", "mcp"])
     }
 
     fn spawn(program: &str, args: &[&str]) -> Self {
@@ -35,7 +35,7 @@ impl Client {
     /// `/dev/full`, ...). No stdout reader runs, so `request`/`read` are unavailable.
     fn start_with_stdout(stdout: Stdio) -> Self {
         Self::spawn_with_stdout(
-            env!("CARGO_BIN_EXE_asus-aura-cli"),
+            env!("CARGO_BIN_EXE_luminactl"),
             &["--dry-run", "mcp"],
             Some(stdout),
         )
@@ -208,7 +208,7 @@ fn silent_child_gives_a_bounded_failure_and_is_reaped() {
 fn a_thousand_write_producing_calls_complete_with_stderr_drained() {
     let mut client = Client::start();
     for _ in 0..1000 {
-        assert_eq!(client.tool("aura_turn_off", json!({}))["isError"], false);
+        assert_eq!(client.tool("lumina_turn_off", json!({}))["isError"], false);
     }
     let (status, stderr) = client.finish();
     assert!(status.success());
@@ -219,7 +219,7 @@ fn a_thousand_write_producing_calls_complete_with_stderr_drained() {
 fn full_session_keeps_stdout_clean_json_rpc() {
     let mut client = Client::start();
     let init = client.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}));
-    assert_eq!(init["result"]["serverInfo"]["name"], "asus-aura");
+    assert_eq!(init["result"]["serverInfo"]["name"], "luminactl");
     client.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
 
     let tools = client.request("tools/list", json!({}));
@@ -232,17 +232,17 @@ fn full_session_keeps_stdout_clean_json_rpc() {
     assert_eq!(
         names,
         [
-            "aura_get_status",
-            "aura_set_color",
-            "aura_set_effect",
-            "aura_turn_off",
-            "aura_agent_state"
+            "lumina_get_status",
+            "lumina_set_color",
+            "lumina_set_effect",
+            "lumina_turn_off",
+            "lumina_agent_state"
         ]
     );
 
     // These all write registers, whose dry-run traces must go to stderr.
     let color = client.tool(
-        "aura_set_color",
+        "lumina_set_color",
         json!({"target": "mobo", "zone": 4, "color": "#ff0055"}),
     );
     assert_eq!(color["isError"], false);
@@ -250,13 +250,18 @@ fn full_session_keeps_stdout_clean_json_rpc() {
         color["structuredContent"]["applied"]["motherboard"]["zone"],
         4
     );
-    let off = client.tool("aura_turn_off", json!({}));
+    let off = client.tool("lumina_turn_off", json!({}));
     assert_eq!(off["structuredContent"]["applied"]["gpu"]["mode"], "off");
 
-    let status = client.tool("aura_get_status", json!({}));
+    let status = client.tool("lumina_get_status", json!({}));
+    // Legacy tool names keep working.
+    assert_eq!(client.tool("aura_get_status", json!({}))["isError"], false);
     assert_eq!(status["structuredContent"]["gpu"]["magic_verified"], true);
 
-    let topology = client.request("resources/read", json!({"uri": "aura://hardware/topology"}));
+    let topology = client.request(
+        "resources/read",
+        json!({"uri": "lumina://hardware/topology"}),
+    );
     assert!(topology["result"]["contents"][0]["text"]
         .as_str()
         .unwrap()
@@ -267,16 +272,16 @@ fn full_session_keeps_stdout_clean_json_rpc() {
 fn agent_state_reverts_by_itself() {
     let mut client = Client::start();
     let failure = client.tool(
-        "aura_agent_state",
+        "lumina_agent_state",
         json!({"state": "failure", "duration_seconds": 1}),
     );
     assert_eq!(failure["structuredContent"]["pattern"], "red_strobe");
-    let held = client.tool("aura_get_status", json!({}));
+    let held = client.tool("lumina_get_status", json!({}));
     assert_eq!(held["structuredContent"]["agent_state"]["state"], "failure");
 
     // The server's own timer fires with no client traffic in between.
     std::thread::sleep(Duration::from_millis(1400));
-    let after = client.tool("aura_get_status", json!({}));
+    let after = client.tool("lumina_get_status", json!({}));
     assert_eq!(after["structuredContent"]["agent_state"], Value::Null);
 }
 
@@ -321,7 +326,7 @@ fn signals_restore_baseline_and_exit_cleanly() {
     for signal in ["-TERM", "-INT"] {
         let mut client = Client::start();
         assert_eq!(
-            client.tool("aura_agent_state", json!({"state": "working"}))["isError"],
+            client.tool("lumina_agent_state", json!({"state": "working"}))["isError"],
             false
         );
         assert!(Command::new("kill")
@@ -344,7 +349,7 @@ fn signals_restore_baseline_and_exit_cleanly() {
 fn static_without_color_only_writes_motherboard_mode_registers() {
     let mut client = Client::start();
     let result = client.tool(
-        "aura_set_effect",
+        "lumina_set_effect",
         json!({"target": "mobo", "mode": "static"}),
     );
     assert_eq!(result["isError"], false);
@@ -390,7 +395,7 @@ fn closed_stdout_restores_the_baseline_before_a_failing_exit() {
     let mut reader = BufReader::new(reader);
     client.send(tool_call(
         1,
-        "aura_agent_state",
+        "lumina_agent_state",
         json!({"state": "working"}),
     ));
     let mut line = String::new();
@@ -415,7 +420,7 @@ fn stdout_flush_failure_behaves_like_a_closed_pipe() {
     let mut client = Client::start_with_stdout(Stdio::from(full));
     client.send(tool_call(
         1,
-        "aura_agent_state",
+        "lumina_agent_state",
         json!({"state": "working"}),
     ));
     let status = client.wait_exit(Duration::from_secs(5));
@@ -432,7 +437,7 @@ fn unread_replies_do_not_stall_the_watchdog_or_sigterm() {
     let mut reader = BufReader::new(reader);
     client.send(tool_call(
         1,
-        "aura_agent_state",
+        "lumina_agent_state",
         json!({"state": "failure", "duration_seconds": 1}),
     ));
     let mut line = String::new();
@@ -466,7 +471,7 @@ fn sustained_output_backpressure_ends_the_session_with_cleanup() {
     let mut reader = BufReader::new(reader);
     client.send(tool_call(
         1,
-        "aura_agent_state",
+        "lumina_agent_state",
         json!({"state": "failure", "duration_seconds": 30}),
     ));
     let mut line = String::new();

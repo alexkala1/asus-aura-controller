@@ -1,14 +1,18 @@
 [package]
-name = "asus-aura-cli"
+name = "luminactl"
 version = "0.1.0"
 edition = "2021"
-description = "Pure Linux CLI for ASUS Aura GPU and Motherboard LEDs"
+description = "Pure Linux CLI, MCP server, and Web Studio for RGB lighting — reverse-engineered for ASUS Aura Sync hardware"
 license = "MIT"
-repository = "https://github.com/alexkala/asus-aura-controller"
-homepage = "https://github.com/alexkala/asus-aura-controller"
+repository = "https://github.com/alexkala1/luminactl"
+homepage = "https://github.com/alexkala1/luminactl"
 readme = "README.md"
-keywords = ["asus", "aura", "rgb", "hardware", "mcp"]
+keywords = ["rgb", "lighting", "hardware", "mcp", "linux"]
 categories = ["command-line-utilities", "hardware-support"]
+
+[[bin]]
+name = "luminactl"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }

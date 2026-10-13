@@ -7,7 +7,7 @@ Thanks for helping. This project writes to real hardware registers, so the bar f
 Needs Linux, a recent stable Rust toolchain (`rustup`; developed on 1.98) and Python 3 for the helper tests.
 
 ```sh
-git clone https://github.com/alexkala/asus-aura-controller && cd asus-aura-controller
+git clone https://github.com/alexkala1/luminactl && cd luminactl
 rustup component add rustfmt clippy
 cargo build
 ```
@@ -18,7 +18,7 @@ Run these before every push (CI runs the same):
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test                                  # unit tests, CLI dry-run tests, MCP stdio tests
-python3 -m unittest tests.test_aura         # Python reference implementation
+python3 -m unittest tests.test_lumina         # Python reference implementation
 ```
 
 The web UI tests use Python 3.12 and Playwright Chromium, with the same pinned dependencies as CI:
@@ -41,9 +41,9 @@ cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo
 
 ## Testing hardware safely
 
-1. **Default to `--dry-run`.** `asus-aura-cli --dry-run <command>` runs the real command path with a fake transport and prints each register write to stdout (to stderr under `mcp`). Use it for every change first. `--dry-run mcp` works the same way for the MCP server.
+1. **Default to `--dry-run`.** `luminactl --dry-run <command>` runs the real command path with a fake transport and prints each register write to stdout (to stderr under `mcp`). Use it for every change first. `--dry-run mcp` works the same way for the MCP server.
 2. **Unit-test against mock registers.** `src/gpu.rs` and `src/mobo.rs` have mock transports that record every register write in order; assert exact write sequences there rather than "it looked right on my LEDs".
-3. **Only then go live,** on supported hardware, with this order: `status` (read-only), one static color on one device, then modes. Keep a way to turn the lights off (`asus-aura-cli all --off`) within reach.
+3. **Only then go live,** on supported hardware, with this order: `status` (read-only), one static color on one device, then modes. Keep a way to turn the lights off (`luminactl all --off`) within reach.
 4. **Never weaken an identity check** (GPU magic, motherboard firmware prefix) to get a test or a board working. Add new identities next to the existing ones instead.
 5. Do not run other RGB tools against the same buses at the same time.
 

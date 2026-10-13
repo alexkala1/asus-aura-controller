@@ -1,7 +1,7 @@
 {
   "mcpServers": {
-    "asus-aura-dry-run": {
-      "command": "asus-aura-cli",
+    "luminactl-dry-run": {
+      "command": "luminactl",
       "args": ["--dry-run", "mcp"]
     }
   }

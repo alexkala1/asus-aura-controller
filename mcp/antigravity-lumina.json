@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "luminactl": {
+      "command": "sudo",
+      "args": ["-n", "/usr/local/bin/luminactl", "mcp"]
+    }
+  }
+}
