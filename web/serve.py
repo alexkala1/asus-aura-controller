@@ -43,6 +43,18 @@ class LuminaRequestHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(WEB_DIR), **kwargs)
 
+    def end_headers(self):
+        # Assets and errors need the same policy as JSON; stale JS can send obsolete commands.
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        super().end_headers()
+
+    def send_head(self):
+        # SimpleHTTPRequestHandler otherwise honors If-Modified-Since with a stale 304.
+        for name in ("If-Modified-Since", "If-None-Match"):
+            if name in self.headers:
+                del self.headers[name]
+        return super().send_head()
+
     def handle(self):
         timer = threading.Timer(CONNECTION_DEADLINE, self._abort_connection)
         timer.daemon = True
@@ -210,7 +222,6 @@ class LuminaRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
-            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(payload)
         except (BrokenPipeError, ConnectionResetError, socket.timeout):
@@ -235,6 +246,7 @@ class BoundedThreadingServer(http.server.ThreadingHTTPServer):
         if not self._slots.acquire(blocking=False):
             try:
                 request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n"
+                                b"Cache-Control: no-cache, no-store, must-revalidate\r\n"
                                 b"Content-Length: 0\r\n\r\n")
             except OSError:
                 pass

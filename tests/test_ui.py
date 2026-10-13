@@ -36,11 +36,15 @@ def apply_status(state, payload):
         spectrum_like = ("spectrum", "rainbow", "rainbow-breathing", "wave", "rainbow-pulse")
         gpu["mode"] = ("off" if payload["off"] else "spectrum" if payload["mode"] in spectrum_like
                        else payload["mode"] if payload["mode"] in ("static", "breathing", "flashing") else "static")
+        gpu["color_source"] = "autonomous" if gpu["mode"] == "spectrum" else "configured"
+        gpu["color_configurable"] = gpu["mode"] not in ("spectrum", "off")
         if not payload["off"] and payload.get("color"):
             gpu["color_hex"] = payload["color"]
     if payload["target"] in ("all", "mobo"):
         mobo = state["data"]["motherboard"]
         mobo["mode"] = "off" if payload["off"] else payload["mode"]
+        mobo["color_configurable"] = mobo["mode"] in ("static", "breathing", "flashing", "chase", "chase-fade")
+        mobo["color_source"] = ("direct" if mobo["mode"] == "static" else "effect") if mobo["color_configurable"] else "autonomous"
         mobo["speed"] = payload["speed"] if payload["target"] == "mobo" else 0
         if not payload["off"] and payload["mode"] == "static" and payload.get("color"):
             for zone in mobo["zones"]:
@@ -241,7 +245,7 @@ def test_preserves_native_hardware_modes(page, daemon, native):
     daemon["data"]["motherboard"]["mode"] = native
     page.goto(URL, wait_until="networkidle")
     expect(page.locator("#live-status")).to_have_text("● LIVE")
-    page.locator("#mobo-color").focus()
+    page.locator("#mobo-mode").focus()  # autonomous modes intentionally disable their color picker
     expect(page.locator("#command-preview")).to_contain_text(f"--mode {native.replace('_', '-')}")
 
 
@@ -339,6 +343,72 @@ def test_gpu_only_rainbow_names_the_spectrum_mode_and_sends_no_color(page, daemo
     # Color-driven effects still carry their color.
     page.locator("#gpu-mode").select_option("breathing")
     expect(page.locator("#command-preview")).to_have_text("sudo luminactl gpu --color ff0055 --mode breathing")
+
+
+@pytest.mark.parametrize("width", [375, 1440])
+@pytest.mark.parametrize("metadata", [True, False])
+def test_autonomous_status_ignores_black_buffers_and_needs_no_picker_color(page, daemon, width, metadata):
+    page.set_viewport_size({"width": width, "height": 1000})
+    gpu = daemon["data"]["gpu"]
+    mobo = daemon["data"]["motherboard"]
+    gpu.update(mode="spectrum", color_hex="000000", color_source="autonomous", color_configurable=False)
+    mobo.update(mode="rainbow", color_source="autonomous", color_configurable=False)
+    if not metadata:  # older daemons expose RGB buffers without describing their meaning
+        for device in (gpu, mobo):
+            device.pop("color_source")
+            device.pop("color_configurable")
+    for zone in mobo["zones"]:
+        zone["hex"] = "000000"
+    page.goto(URL, wait_until="networkidle")
+    expect(page.locator("#live-status")).to_have_text("● LIVE")
+    for device in ("gpu", "mobo"):
+        expect(page.locator(f"#{device}-color")).to_be_disabled()
+        expect(page.locator(f"#{device} .hex-value")).to_have_text("Auto")
+    expect(page.locator("#command-preview")).to_have_text("sudo luminactl gpu --mode spectrum")
+    expect(page.locator("#btn-apply")).to_be_enabled()
+    expect(page.locator('.zone-led[data-zone="0"]')).to_have_attribute("data-color", "")
+    expect(page.locator('.zone-led[data-zone="0"]')).to_have_attribute("aria-label", "Back I/O zone 0: automatic effect colors")
+    page.locator("#sync-all").check()
+    page.locator("#btn-apply").click()
+    expect(page.locator("#status-toast")).to_have_text("✓ Applied to hardware.")
+    assert "color" not in daemon["writes"][-1]
+    assert daemon["writes"][-1]["mode"] == "spectrum"
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+    assert daemon["page_errors"] == []
+    assert daemon["console_errors"] == []
+    page.locator("#sync-all").uncheck()
+    page.locator("#gpu-mode").select_option("static")
+    expect(page.locator("#gpu-color")).to_be_enabled()
+    expect(page.locator("#command-preview")).to_have_text("sudo luminactl gpu --color ffffff --mode static")
+
+
+def test_autonomous_refresh_preserves_last_configured_color_for_later_static(page, daemon):
+    page.goto(URL, wait_until="networkidle")
+    gpu = daemon["data"]["gpu"]
+    gpu.update(mode="spectrum", color_hex="000000", color_source="autonomous", color_configurable=False)
+    page.locator("#btn-refresh").click()
+    expect(page.locator("#gpu-mode")).to_have_value("color-cycle")
+    expect(page.locator("#gpu-color")).to_have_value("#ff0055")
+    expect(page.locator("#gpu .hex-value")).to_have_text("Auto")
+    page.locator("#gpu-mode").select_option("static")
+    expect(page.locator("#gpu-color")).to_be_enabled()
+    expect(page.locator("#command-preview")).to_have_text("sudo luminactl gpu --color ff0055 --mode static")
+
+
+@pytest.mark.parametrize("source, mode", [("direct", "static"), ("effect", "breathing")])
+def test_configurable_color_metadata_keeps_real_black_and_effect_colors(page, daemon, source, mode):
+    gpu = daemon["data"]["gpu"]
+    gpu.update(color_hex="000000", color_source="configured", color_configurable=True)
+    mobo = daemon["data"]["motherboard"]
+    mobo.update(mode=mode, color_source=source, color_configurable=True)
+    for zone in mobo["zones"]:
+        zone["hex"] = "123456"
+    page.goto(URL, wait_until="networkidle")
+    expect(page.locator("#gpu .hex-value")).to_have_text("#000000")
+    expect(page.locator("#gpu-color")).to_be_enabled()
+    expect(page.locator("#mobo-color")).to_have_value("#123456")
+    expect(page.locator("#mobo-color")).to_be_enabled()
+    expect(page.locator('.zone-led[data-zone="0"]')).to_have_attribute("data-color", "#123456")
 
 
 def test_copy_feedback_and_hover_active_states(page, daemon):

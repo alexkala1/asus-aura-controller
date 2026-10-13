@@ -26,6 +26,13 @@ let busy = false;
 // never discards the other's pending changes.
 const dirty = { gpu: false, mobo: false };
 const deviceKey = channel => (channel.id === "gpu" ? "gpu" : "mobo");
+const nativeMode = channel => channel.nativeMode || modes.find(([key]) => key === channel.mode)[2];
+function effectiveMode(channel) {
+  const mode = nativeMode(channel);
+  return channel.id !== "gpu" ? mode : gpuSpectrumModes.has(mode) ? "spectrum" : gpuModes.has(mode) ? mode : "static";
+}
+const configurableColor = channel => channel.mode !== "off" && colorModes.has(effectiveMode(channel));
+const autonomousColor = channel => channel.mode !== "off" && !configurableColor(channel);
 let refreshing = false;
 const sync = $("#sync-all");
 const apply = $("#btn-apply");
@@ -60,6 +67,11 @@ for (const channel of channels) {
       target[key] = value;
       if (key === "color" && target.id === "mobo") zoneColors.fill(value);
       if (key === "mode") target.nativeMode = null;
+      // Static needs an explicit staged color even when the first status was autonomous.
+      if (key === "mode" && effectiveMode(target) === "static" && !target.color) {
+        target.color = "#ffffff";
+        if (target.id === "mobo") zoneColors.fill(target.color);
+      }
     }
     for (const target of linked) dirty[deviceKey(target)] = true;
     setControlState("default");
@@ -88,6 +100,8 @@ function setControlState(state) {
 function lockControls() {
   for (const channel of channels) {
     for (const input of channel.card.querySelectorAll("input, select")) input.disabled = !connected || busy;
+    channel.card.querySelector(".color-picker").disabled = !connected || busy || !configurableColor(channel)
+      || (sync.checked && !colorModes.has(nativeMode(channel)));
     if (channel.id === "gpu") channel.card.querySelector(".speed-slider").disabled = true;
   }
   sync.disabled = !connected || busy;
@@ -99,24 +113,28 @@ function lockControls() {
 function render() {
   for (const channel of channels) {
     const card = channel.card;
-    card.style.setProperty("--led", channel.color || "var(--led-off)");
+    const autonomous = autonomousColor(channel);
+    card.style.setProperty("--led", autonomous ? "var(--color-accent)" : channel.color || "var(--led-off)");
     card.style.setProperty("--duration", `${3 + channel.speed * 1.5}s`);
-    card.dataset.mode = channel.color ? channel.mode : "off";
+    card.dataset.mode = connected ? channel.mode : "off";
+    card.dataset.colorSource = autonomous ? "autonomous" : "configured";
     if (channel.color) card.querySelector(".color-picker").value = channel.color;
-    card.querySelector(".hex-value").textContent = channel.color ? channel.color.toUpperCase() : "—";
+    card.querySelector(".hex-value").textContent = channel.mode === "off" ? "Off" : autonomous ? "Auto" : channel.color ? channel.color.toUpperCase() : "—";
     card.querySelector(".mode-picker").value = channel.mode;
     card.querySelector(".speed-slider").value = channel.speed;
     card.querySelector(".speed-value").textContent = channel.id === "gpu" ? "Fixed" : channel.speed;
   }
-  const led = channel => channel.mode === "off" || !channel.color ? "var(--led-off)" : channel.color;
+  const led = channel => channel.mode === "off" ? "var(--led-off)" : autonomousColor(channel) ? "var(--color-accent)" : channel.color || "var(--led-off)";
   $(".gpu-hardware").style.setProperty("--gpu-led", led(channels[0]));
   const motherboard = channels[1];
   document.querySelectorAll(".zone-led").forEach((element, index) => {
     const color = zoneColors[index];
-    element.style.setProperty("--zone-led", motherboard.mode === "off" || !color ? "var(--led-off)" : color);
-    element.dataset.color = color || "";
+    const autonomous = autonomousColor(motherboard);
+    element.style.setProperty("--zone-led", led({ ...motherboard, color }));
+    element.dataset.color = autonomous ? "" : color || "";
+    element.dataset.colorSource = autonomous ? "autonomous" : "configured";
     element.setAttribute("role", "img");
-    element.setAttribute("aria-label", `${index < 4 ? "Back I/O" : "RGB Header"} zone ${index}: ${!color ? "unverified" : motherboard.mode === "off" ? "off" : color.toUpperCase()}`);
+    element.setAttribute("aria-label", `${index < 4 ? "Back I/O" : "RGB Header"} zone ${index}: ${motherboard.mode === "off" ? "off" : autonomous ? "automatic effect colors" : !color ? "unverified" : color.toUpperCase()}`);
   });
   $(".board-map").dataset.mode = motherboard.mode;
   $(".board-map").style.setProperty("--duration", `${3 + motherboard.speed * 1.5}s`);
@@ -128,7 +146,7 @@ function render() {
 
 function selection() {
   const target = sync.checked ? "all" : active.id === "gpu" ? "gpu" : "mobo";
-  const mapped = active.nativeMode || modes.find(([key]) => key === active.mode)[2];
+  const mapped = nativeMode(active);
   const off = active.mode === "off";
   // Mode name sent to the CLI. `all` takes the native name and maps each device itself;
   // a GPU-only command must name a mode the GPU has.
@@ -159,7 +177,7 @@ function commandNote({ target, mode, mapped }) {
 }
 
 function renderCommand() {
-  if (!active.color) {
+  if (!connected) {
     $("#command-preview").textContent = "Waiting for verified hardware…";
     return;
   }
@@ -183,7 +201,7 @@ function notify(message, state) {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, { ...options, signal: AbortSignal.timeout(12000) });
+  const response = await fetch(path, { ...options, cache: "no-store", signal: AbortSignal.timeout(12000) });
   const data = await response.json();
   if (!response.ok || !data.ok) throw new Error(data.error || `Daemon request failed (${response.status}).`);
   return data;
@@ -222,12 +240,18 @@ async function refreshStatus() {
     const result = await api("/api/status");
     if (result.mode !== "live") throw new Error("Daemon did not return live hardware status.");
     const { gpu, mobo, gpuMode, moboMode } = hardwareData(result.data);
+    // Legacy daemons have no metadata: infer whether their RGB buffers are active.
+    const hasConfiguredColor = (status, channel) => status.color_configurable ?? configurableColor(channel);
     if (!dirty.gpu) {
-      Object.assign(channels[0], { color: `#${gpu.color_hex}`, mode: gpuMode, nativeMode: gpu.mode.replaceAll("_", "-") });
+      Object.assign(channels[0], { mode: gpuMode, nativeMode: gpu.mode.replaceAll("_", "-") });
+      if (gpu.color_source !== "autonomous" && hasConfiguredColor(gpu, channels[0])) channels[0].color = `#${gpu.color_hex}`;
     }
     if (!dirty.mobo) {
-      zoneColors = mobo.zones.map(zone => `#${zone.hex}`);
-      Object.assign(channels[1], { color: zoneColors[0], mode: moboMode, nativeMode: mobo.mode.replaceAll("_", "-"), speed: mobo.speed });
+      Object.assign(channels[1], { mode: moboMode, nativeMode: mobo.mode.replaceAll("_", "-"), speed: mobo.speed });
+      if (mobo.color_source !== "autonomous" && hasConfiguredColor(mobo, channels[1])) {
+        zoneColors = mobo.zones.map(zone => `#${zone.hex}`);
+        channels[1].color = zoneColors[0];
+      }
     }
     connected = true;
     $(".connection").dataset.state = "success";

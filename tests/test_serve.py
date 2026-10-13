@@ -311,3 +311,36 @@ def test_autonomous_modes_apply_without_a_color_but_static_still_needs_one(start
         response = exchange(port, post(f"Content-Length: {len(body)}\r\n", body))
         assert status_of(response) == 400
     assert len(server_module.calls) == before
+
+
+@pytest.mark.parametrize("method, path", [("GET", "/"), ("GET", "/app.js"), ("HEAD", "/style.css"),
+                                          ("GET", "/not-found"), ("GET", "/api/status"), ("OPTIONS", "/api/apply")])
+def test_every_daemon_response_disables_caching(start, method, path):
+    port = start()
+    response = exchange(port, f"{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".encode())
+    headers = response.split(b"\r\n\r\n", 1)[0].lower()
+    assert b"cache-control: no-cache, no-store, must-revalidate" in headers
+
+
+def test_conditional_static_requests_receive_fresh_assets_not_304(start):
+    port = start()
+    response = exchange(port, b"GET /app.js HTTP/1.1\r\nHost: x\r\nIf-Modified-Since: Wed, 01 Jan 2100 00:00:00 GMT\r\nIf-None-Match: *\r\nConnection: close\r\n\r\n")
+    assert status_of(response) == 200
+    assert b'"use strict"' in response.split(b"\r\n\r\n", 1)[1]
+
+
+def test_overload_response_disables_caching(start):
+    port = start(max_active=1)
+    held = socket.create_connection(("127.0.0.1", port))
+    try:
+        held.sendall(b"GET / HTTP/1.1\r\nHos")
+        deadline = time.monotonic() + 2
+        while start.last._slots.acquire(blocking=False):
+            start.last._slots.release()
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        response = exchange(port, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        assert status_of(response) == 503
+        assert b"Cache-Control: no-cache, no-store, must-revalidate\r\n" in response
+    finally:
+        held.close()
