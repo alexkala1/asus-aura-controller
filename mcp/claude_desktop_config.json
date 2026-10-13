@@ -2,7 +2,7 @@
   "mcpServers": {
     "asus-aura": {
       "command": "sudo",
-      "args": ["-n", "/home/alexkala/repos/asus-aura-controller/target/release/asus-aura-cli", "mcp"]
+      "args": ["-n", "/usr/local/bin/asus-aura-cli", "mcp"]
     }
   }
 }

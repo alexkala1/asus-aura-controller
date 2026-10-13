@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "asus-aura-dry-run": {
-      "command": "/home/alexkala/repos/asus-aura-controller/target/release/asus-aura-cli",
+      "command": "asus-aura-cli",
       "args": ["--dry-run", "mcp"]
     }
   }

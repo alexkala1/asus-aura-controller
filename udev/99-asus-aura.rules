@@ -4,9 +4,10 @@
 # 1. Allow group 'i2c' read/write access to NVIDIA GPU I2C character device
 KERNEL=="i2c-[0-9]*", GROUP="i2c", MODE="0660"
 
-# 2. Daily non-root usage options:
-# Option A (Recommended): Allow passwordless sudo for the aura-ctl binary:
-#   echo "%wheel ALL=(ALL) NOPASSWD: /home/alexkala/repos/asus-aura-controller/aura-ctl" | sudo tee /etc/sudoers.d/99-aura-ctl
+# NOTE: this matches EVERY i2c bus, not just the GPU. Group members get raw access to all
+# of them (including DIMM SPD buses). Add only users you trust to the 'i2c' group.
+# The CLI itself only talks to /dev/i2c-0 address 0x29 and checks the GPU signature first.
 #
-# Option B (File capabilities for raw I/O port access on NCT6793D):
-#   sudo setcap cap_sys_rawio+ep $(readlink -f $(which python3))
+# 2. The motherboard uses /dev/port, which udev rules cannot open up. Run those commands
+#    through sudo; see "Safety and permissions" in README.md and SECURITY.md for a
+#    least-privilege sudoers rule (it requires a root-owned binary, not one from target/).

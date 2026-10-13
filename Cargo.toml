@@ -3,6 +3,12 @@ name = "asus-aura-cli"
 version = "0.1.0"
 edition = "2021"
 description = "Pure Linux CLI for ASUS Aura GPU and Motherboard LEDs"
+license = "MIT"
+repository = "https://github.com/alexkala/asus-aura-controller"
+homepage = "https://github.com/alexkala/asus-aura-controller"
+readme = "README.md"
+keywords = ["asus", "aura", "rgb", "hardware", "mcp"]
+categories = ["command-line-utilities", "hardware-support"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }

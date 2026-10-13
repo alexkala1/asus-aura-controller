@@ -5,7 +5,7 @@
 * **Source Package**: Official ASUS CDN Standalone Lighting Control Utility  
 * **URL**: `https://dlcdnets.asus.com/pub/ASUS/mb/14Utilities/Lighting_Control_1.07.84_v2.zip`  
 * **Package Size**: 207,956,594 bytes (~198 MiB)  
-* **Local Extraction Path**: `/home/alexkala/repos/asus-aura-controller/upstream_binaries/extracted/`
+* **Local Extraction Path**: `upstream_binaries/extracted/` (git-ignored; never committed)
 
 ### Triage via REA (`rea-agents` & MCP)
 Using REA (`inspect_managed_artifact`, `open_binary`, `binary_session`):
@@ -123,5 +123,5 @@ Using REA (`inspect_managed_artifact`, `open_binary`, `binary_session`):
 2. **Super I/O Port Locking**:
    On Linux, communicating with `0x02c0` requires raw port access (`/dev/port` with root/sudo or `iopl(3)` / `ioperm(3)`). Direct port access via `/dev/port` provides an immediate, zero-compilation user-space driver.
 3. **Reference Controller Verification**:
-   The standalone tool [aura_ctl.py](file:///home/alexkala/repos/asus-aura-controller/aura_ctl.py) implements both the GPU and Motherboard protocols, with safety signature verification and comprehensive unit tests.
+   The standalone tool [aura_ctl.py](aura_ctl.py) implements both the GPU and Motherboard protocols, with safety signature verification and comprehensive unit tests.
 

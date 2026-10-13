@@ -13,7 +13,8 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 WEB_DIR = ROOT_DIR / "web"
-CLI_BIN = ROOT_DIR / "target" / "release" / "asus-aura-cli"
+# sudo rules must point at a root-owned binary (see SECURITY.md), so allow an override.
+CLI_BIN = Path(os.environ.get("AURA_CLI_BIN", ROOT_DIR / "target" / "release" / "asus-aura-cli"))
 PORT = int(os.environ.get("AURA_PORT", 7890))
 
 class AuraRequestHandler(http.server.SimpleHTTPRequestHandler):

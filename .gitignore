@@ -7,5 +7,7 @@ upstream_binaries/extracted/*.cab
 __pycache__/
 *.pyc
 tests/__pycache__/
+.venv/
+.pytest_cache/
 target/
 upstream_binaries/

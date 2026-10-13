@@ -1,7 +1,7 @@
 # Codex Builder Brief: ASUS Aura Controller Implementation
 
 ## Goal
-Implement a standalone Linux CLI utility (`aura-ctl` / `aura_controller.py`) in `/home/alexkala/repos/asus-aura-controller` to read and set the RGB LEDs of:
+Implement a standalone Linux CLI utility (`aura-ctl` / `aura_controller.py`) in the repository root to read and set the RGB LEDs of:
 1. ASUS GeForce GTX 1060 (via `/dev/i2c-0` slave `0x29`)
 2. ASUS ROG STRIX Z270E GAMING motherboard (via NCT6793D Super I/O SMBus at port `0x02c0` slave `0x4e`)
 
