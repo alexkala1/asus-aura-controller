@@ -1,9 +1,9 @@
 //! Drives `asus-aura-cli --dry-run mcp` over real stdio, like an MCP client would.
 
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 struct Client {
     child: Child,
@@ -141,4 +141,101 @@ fn malformed_input_gets_an_error_and_the_server_keeps_running() {
         .unwrap();
     assert_eq!(client.read()["error"]["code"], -32700);
     assert_eq!(client.request("ping", json!({}))["result"], json!({}));
+}
+
+#[test]
+fn oversized_message_is_discarded_then_ping_succeeds() {
+    let mut client = Client::start();
+    client
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&vec![b'x'; 1024 * 1024 + 1])
+        .unwrap();
+    // The error arrives even before the oversized stream ends.
+    let error = client.read();
+    assert_eq!(error["error"]["code"], -32600);
+    assert_eq!(error["error"]["message"], "message too large");
+    assert_eq!(error["id"], Value::Null);
+    client
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"discard this too\n")
+        .unwrap();
+    assert_eq!(client.request("ping", json!({}))["result"], json!({}));
+}
+
+#[test]
+fn signals_restore_baseline_and_exit_cleanly() {
+    for signal in ["-TERM", "-INT"] {
+        let mut client = Client::start();
+        assert_eq!(
+            client.tool("aura_agent_state", json!({"state": "working"}))["isError"],
+            false
+        );
+        assert!(Command::new("kill")
+            .args([signal, &client.child.id().to_string()])
+            .status()
+            .unwrap()
+            .success());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let status = loop {
+            if let Some(status) = client.child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                client.child.kill().unwrap();
+                panic!("server did not shut down promptly");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(status.success());
+        let mut stderr = String::new();
+        client
+            .child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(stderr.contains("shutdown signal received"));
+        assert!(stderr.contains("clean shutdown"));
+        // Dry-run baseline is GPU off and motherboard rainbow.
+        assert!(stderr.contains("GPU Write: Reg 0x07 <= 0x00"));
+        assert!(stderr.contains("Mobo Write: Reg 0x8021 <= 0x05"));
+    }
+}
+
+#[test]
+fn static_without_color_only_writes_motherboard_mode_registers() {
+    let mut client = Client::start();
+    let result = client.tool(
+        "aura_set_effect",
+        json!({"target": "mobo", "mode": "static"}),
+    );
+    assert_eq!(result["isError"], false);
+    client.stdin.take();
+    assert!(client.child.wait().unwrap().success());
+    let mut stderr = String::new();
+    client
+        .child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    let writes: Vec<_> = stderr
+        .lines()
+        .filter(|line| line.contains("Mobo Write:"))
+        .collect();
+    assert_eq!(
+        writes,
+        [
+            "[DRY-RUN] Mobo Write: Reg 0x8021 <= 0x01",
+            "[DRY-RUN] Mobo Write: Reg 0x8022 <= 0x00",
+            "[DRY-RUN] Mobo Write: Reg 0x8023 <= 0x00",
+            "[DRY-RUN] Mobo Write: Reg 0x80a0 <= 0x01",
+        ]
+    );
 }

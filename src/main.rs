@@ -1,4 +1,5 @@
 mod gpu;
+mod hardware_lock;
 mod mcp;
 mod mobo;
 mod protocol;
@@ -46,7 +47,7 @@ enum Command {
     All {
         #[arg(long, required_unless_present = "off")]
         color: Option<String>,
-        #[arg(long, default_value = "static")]
+        #[arg(long, default_value = "static", value_parser = parse_all_mode)]
         mode: String,
         #[arg(long)]
         off: bool,
@@ -55,6 +56,18 @@ enum Command {
 
 fn parse_mobo_mode(name: &str) -> Result<MoboMode, String> {
     MoboMode::from_str(&name.replace('_', "-"), false)
+}
+
+fn parse_all_mode(name: &str) -> Result<String, String> {
+    let normalized = name.replace('_', "-");
+    if mcp::find_effect(&normalized).is_some()
+        || GpuMode::from_str(&normalized, false).is_ok()
+        || parse_mobo_mode(&normalized).is_ok()
+    {
+        Ok(normalized)
+    } else {
+        Err(format!("invalid mode '{name}'"))
+    }
 }
 
 // Trait objects select the real or dry-run transport without duplicating dispatch.
@@ -147,6 +160,9 @@ pub fn run(cli: Cli) -> Result<String, String> {
             speed,
             off,
         } => {
+            if color.is_some() && mode != MoboMode::Static && !off {
+                eprintln!("warning: --color is ignored for effect modes; motherboard effects keep their stored colors");
+            }
             if off {
                 mobo_controller(dry)?.set_mode(MoboMode::Off, 0, 0)?;
                 Ok("[MOBO] LEDs turned off.".to_owned())
@@ -177,8 +193,14 @@ pub fn run(cli: Cli) -> Result<String, String> {
             let mut gpu = gpu_controller(dry)?;
             let mut mobo = mobo_controller(dry)?;
             if let Some((r, g, b)) = rgb {
-                let gpu_mode = GpuMode::from_str(&mode, false).unwrap_or(GpuMode::Static);
-                let mobo_mode = parse_mobo_mode(&mode).unwrap_or(MoboMode::Static);
+                let (gpu_mode, mobo_mode) = mcp::find_effect(&mode)
+                    .map(|(gpu, mobo, _)| (gpu.unwrap_or(GpuMode::Static), mobo))
+                    .unwrap_or_else(|| {
+                        (
+                            GpuMode::from_str(&mode, false).unwrap_or(GpuMode::Static),
+                            parse_mobo_mode(&mode).unwrap_or(MoboMode::Static),
+                        )
+                    });
                 gpu.set_color(r, g, b, gpu_mode)?;
                 if mobo_mode == MoboMode::Static {
                     mobo.set_color_static(r, g, b)?;
@@ -251,6 +273,7 @@ mod cli_tests {
             vec!["aura", "mobo", "--speed", "-1"],
             vec!["aura", "gpu", "--mode", "rainbow"],
             vec!["aura", "mobo", "--mode", "invalid"],
+            vec!["aura", "all", "--color", "112233", "--mode", "invalid"],
         ] {
             assert!(Cli::try_parse_from(args).is_err());
         }
@@ -309,8 +332,8 @@ mod cli_tests {
                 "[ALL] Synchronized GPU and Motherboard to #112233 (Mode: rainbow).",
             ),
             (
-                vec!["all", "--color", "112233", "--mode", "invalid"],
-                "[ALL] Synchronized GPU and Motherboard to #112233 (Mode: invalid).",
+                vec!["all", "--color", "112233", "--mode", "rainbow_breathing"],
+                "[ALL] Synchronized GPU and Motherboard to #112233 (Mode: rainbow-breathing).",
             ),
         ] {
             let cli = Cli::try_parse_from(["aura", "--dry-run"].into_iter().chain(args)).unwrap();

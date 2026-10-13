@@ -32,13 +32,13 @@ fn port_error(error: io::Error) -> io::Error {
 
 impl DevPort {
     pub fn open() -> io::Result<Self> {
-        Ok(Self {
-            file: OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open("/dev/port")
-                .map_err(port_error)?,
-        })
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/port")
+            .map_err(port_error)?;
+        crate::hardware_lock::acquire(&file, "/dev/port")?;
+        Ok(Self { file })
     }
 }
 

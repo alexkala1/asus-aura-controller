@@ -37,7 +37,7 @@ What "tested" covers: the maintainer's own machine (x86_64 Linux). The agent-sta
 Requires a recent stable Rust toolchain (developed on 1.98), Linux, and for live use the `i2c-dev` kernel module.
 
 ```sh
-git clone https://github.com/OWNER/asus-aura-controller && cd asus-aura-controller
+git clone https://github.com/alexkala/asus-aura-controller && cd asus-aura-controller
 cargo build --release
 cargo test
 ```
@@ -83,6 +83,8 @@ sudo install -m 0755 target/release/asus-aura-cli /usr/local/bin/asus-aura-cli
 ```
 
 ## MCP server
+
+Each agent starts its own server process. Hardware access is serialized with advisory locks on the device files themselves (`/dev/i2c-0`, `/dev/port`). The saved baseline is per process: agents setting states simultaneously can capture each other's pattern as their baseline. Have only one agent drive `aura_agent_state` at a time.
 
 `asus-aura-cli mcp` speaks newline-delimited JSON-RPC 2.0 on stdio (protocol versions 2025-06-18, 2025-03-26, 2024-11-05). stdout carries protocol messages only; logs and `--dry-run` register traces go to stderr.
 

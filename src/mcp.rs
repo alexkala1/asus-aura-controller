@@ -3,6 +3,7 @@
 //! stdout carries protocol messages only; every diagnostic goes to stderr.
 
 use std::io::{self, BufRead, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -69,7 +70,7 @@ const EFFECTS: [(&[&str], Option<GpuMode>, MoboMode); 13] = [
     ),
 ];
 
-fn find_effect(name: &str) -> Option<(Option<GpuMode>, MoboMode, &'static str)> {
+pub(crate) fn find_effect(name: &str) -> Option<(Option<GpuMode>, MoboMode, &'static str)> {
     let wanted = name.to_ascii_lowercase().replace('_', "-");
     EFFECTS
         .iter()
@@ -104,6 +105,7 @@ struct GpuOp {
 #[derive(Debug, PartialEq, Eq)]
 enum MoboOp {
     Off,
+    Mode(MoboMode),
     Static(Rgb),
     Zone(u8, Rgb),
     Effect {
@@ -172,6 +174,7 @@ fn plan_effect(
     if target.mobo() {
         plan.mobo = Some(match (mobo_mode, color) {
             (MoboMode::Static, Some(color)) => MoboOp::Static(color),
+            (MoboMode::Static, None) => MoboOp::Mode(MoboMode::Static),
             _ => MoboOp::Effect {
                 mode: mobo_mode,
                 speed: speed.unwrap_or(0),
@@ -200,6 +203,7 @@ fn describe_gpu(op: &GpuOp) -> Value {
 fn describe_mobo(op: &MoboOp) -> Value {
     match op {
         MoboOp::Off => json!({"mode": "off"}),
+        MoboOp::Mode(mode) => json!({"mode": mode.name()}),
         MoboOp::Static(c) => json!({"mode": "static", "color": hex(*c)}),
         MoboOp::Zone(zone, c) => json!({"mode": "static", "zone": zone, "color": hex(*c)}),
         MoboOp::Effect { mode, speed, color } => {
@@ -218,6 +222,7 @@ fn apply_gpu(gpu: &mut Gpu, op: &GpuOp) -> Result<(), String> {
 fn apply_mobo(mobo: &mut Mobo, op: &MoboOp) -> Result<(), String> {
     match *op {
         MoboOp::Off => mobo.set_mode(MoboMode::Off, 0, 0),
+        MoboOp::Mode(mode) => mobo.set_mode(mode, 0, 0),
         MoboOp::Static((r, g, b)) => mobo.set_color_static(r, g, b),
         MoboOp::Zone(zone, (r, g, b)) => mobo.set_zone_color(zone, r, g, b),
         MoboOp::Effect { mode, speed, color } => mobo.set_effect(mode, speed, color),
@@ -302,6 +307,7 @@ struct AgentHold {
     state: String,
     baseline: Baseline,
     deadline: Instant,
+    restore_attempts: u8,
 }
 
 // ---------------------------------------------------------------- arguments
@@ -455,6 +461,8 @@ fn topology() -> Value {
 pub struct Server {
     dry_run: bool,
     hold: Option<AgentHold>,
+    #[cfg(test)]
+    fail_restore: bool,
 }
 
 fn rpc_error(id: &Value, code: i32, message: impl Into<String>) -> Value {
@@ -471,6 +479,8 @@ impl Server {
         Self {
             dry_run,
             hold: None,
+            #[cfg(test)]
+            fail_restore: false,
         }
     }
 
@@ -613,14 +623,19 @@ impl Server {
         let connected = gpu.is_ok() || mobo.is_ok();
         let (gk, gv) = side(gpu, "gpu");
         let (mk, mv) = side(mobo, "motherboard");
+        let hold = self.hold_status();
+        json!({"connected": connected, "dry_run": self.dry_run, gk: gv, mk: mv, "agent_state": hold})
+    }
+
+    fn hold_status(&self) -> Value {
         let now = Instant::now();
-        let hold = self.hold.as_ref().map(|h| {
+        self.hold.as_ref().map(|h| {
             json!({
-                "state": h.state,
+                "state": if h.restore_attempts > 0 { "restoring" } else { &h.state },
+                "restore_attempts": h.restore_attempts,
                 "reverts_in_seconds": h.deadline.saturating_duration_since(now).as_secs_f32().ceil()
             })
-        });
-        json!({"connected": connected, "dry_run": self.dry_run, gk: gv, mk: mv, "agent_state": hold})
+        }).unwrap_or(Value::Null)
     }
 
     fn set_color(&mut self, args: &Map<String, Value>) -> Result<(Value, bool), String> {
@@ -720,6 +735,7 @@ impl Server {
             state: state.to_owned(),
             baseline,
             deadline: Instant::now() + hold_for,
+            restore_attempts: 0,
         });
         let (mut body, ok) = run_plan(&pattern.plan, gpu.as_mut(), mobo.as_mut());
         body["state_applied"] = json!(state);
@@ -733,9 +749,36 @@ impl Server {
 
     /// Returns whether anything was restored; errors from the hardware are surfaced.
     fn restore_baseline(&mut self) -> Result<bool, String> {
-        let Some(hold) = self.hold.take() else {
+        if self.hold.is_none() {
             return Ok(false);
-        };
+        }
+        let result = self.write_baseline();
+        match result {
+            Ok(()) => {
+                self.hold = None;
+                Ok(true)
+            }
+            Err(error) => {
+                let hold = self.hold.as_mut().unwrap();
+                hold.restore_attempts += 1;
+                hold.deadline = Instant::now() + Duration::from_secs(5);
+                if hold.restore_attempts >= 3 {
+                    self.hold = None;
+                    eprintln!(
+                        "asus-aura mcp: giving up baseline restore after 3 attempts: {error}"
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn write_baseline(&self) -> Result<(), String> {
+        #[cfg(test)]
+        if self.fail_restore {
+            return Err("injected restore failure".to_owned());
+        }
+        let hold = self.hold.as_ref().unwrap();
         let mut errors = Vec::new();
         if let Some(snapshot) = &hold.baseline.gpu {
             if let Err(e) = gpu_controller(self.dry_run).and_then(|mut c| c.restore(snapshot)) {
@@ -748,7 +791,7 @@ impl Server {
             }
         }
         if errors.is_empty() {
-            Ok(true)
+            Ok(())
         } else {
             Err(format!("Baseline restore failed ({})", errors.join("; ")))
         }
@@ -794,38 +837,104 @@ fn run_plan(plan: &Plan, gpu: Option<&mut Gpu>, mobo: Option<&mut Mobo>) -> (Val
 
 // ---------------------------------------------------------------- stdio loop
 
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" {
+    fn signal(signum: i32, handler: extern "C" fn(i32)) -> usize;
+}
+
+extern "C" fn request_shutdown(_: i32) {
+    SHUTDOWN.store(true, Ordering::Relaxed);
+}
+
+const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+
+enum Input {
+    Line(String),
+    TooLarge,
+}
+
+fn read_input(mut reader: impl BufRead, tx: mpsc::SyncSender<Input>) -> io::Result<()> {
+    let mut line = Vec::new();
+    let mut oversized = false;
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            if !oversized && !line.is_empty() {
+                let _ = tx.send(Input::Line(String::from_utf8_lossy(&line).into_owned()));
+            }
+            return Ok(());
+        }
+        let end = buffer.iter().position(|b| *b == b'\n');
+        let count = end.unwrap_or(buffer.len());
+        if !oversized {
+            if line.len() + count > MAX_MESSAGE_BYTES {
+                oversized = true;
+                line.clear();
+                if tx.send(Input::TooLarge).is_err() {
+                    return Ok(());
+                }
+            } else {
+                line.extend_from_slice(&buffer[..count]);
+            }
+        }
+        reader.consume(count + usize::from(end.is_some()));
+        if end.is_some() {
+            if !oversized
+                && tx
+                    .send(Input::Line(String::from_utf8_lossy(&line).into_owned()))
+                    .is_err()
+            {
+                return Ok(());
+            }
+            line.clear();
+            oversized = false;
+        }
+    }
+}
+
 pub fn serve(dry_run: bool) -> Result<(), String> {
+    // Linux signal handlers only set a lock-free flag; restoration stays on this thread.
+    for signum in [2, 15] {
+        if unsafe { signal(signum, request_shutdown) } == usize::MAX {
+            return Err(format!(
+                "cannot install signal handler: {}",
+                io::Error::last_os_error()
+            ));
+        }
+    }
     crate::protocol::route_dry_run_log_to_stderr();
     let mut server = Server::new(dry_run);
-    let (tx, rx) = mpsc::channel::<String>();
+    let (tx, rx) = mpsc::sync_channel::<Input>(1);
     // Blocking reads live on their own thread so the loop can fire revert timers.
     std::thread::spawn(move || {
-        for line in io::stdin().lock().lines().map_while(Result::ok) {
-            if tx.send(line).is_err() {
-                break;
-            }
+        if let Err(error) = read_input(io::stdin().lock(), tx) {
+            eprintln!("asus-aura mcp: input error: {error}");
         }
     });
     let mut out = io::stdout().lock();
     loop {
-        let line = match server.next_deadline() {
-            Some(deadline) => {
-                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                    Ok(line) => Some(line),
-                    Err(RecvTimeoutError::Timeout) => {
-                        server.expire_if_due(Instant::now());
-                        continue;
-                    }
-                    Err(RecvTimeoutError::Disconnected) => None,
-                }
-            }
-            None => rx.recv().ok(),
-        };
-        let Some(line) = line else { break };
-        if line.trim().is_empty() {
-            continue;
+        if SHUTDOWN.load(Ordering::Relaxed) {
+            eprintln!("asus-aura mcp: shutdown signal received");
+            break;
         }
-        if let Some(reply) = server.handle_line(&line) {
+        server.expire_if_due(Instant::now());
+        let wait = server
+            .next_deadline()
+            .map(|d| d.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::from_millis(250))
+            .min(Duration::from_millis(250));
+        let input = match rx.recv_timeout(wait) {
+            Ok(input) => input,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        let reply = match input {
+            Input::TooLarge => Some(rpc_error(&Value::Null, -32600, "message too large")),
+            Input::Line(line) if line.trim().is_empty() => None,
+            Input::Line(line) => server.handle_line(&line),
+        };
+        if let Some(reply) = reply {
             writeln!(out, "{reply}")
                 .and_then(|()| out.flush())
                 .map_err(|e| e.to_string())?;
@@ -835,6 +944,11 @@ pub fn serve(dry_run: bool) -> Result<(), String> {
     if let Err(e) = server.restore_baseline() {
         eprintln!("asus-aura mcp: {e}");
     }
+    while server.hold.is_some() {
+        std::thread::sleep(Duration::from_millis(250));
+        server.expire_if_due(Instant::now());
+    }
+    eprintln!("asus-aura mcp: clean shutdown");
     Ok(())
 }
 
@@ -856,6 +970,12 @@ mod tests {
 
     #[test]
     fn plans_map_friendly_names_and_flag_gpu_fallbacks() {
+        assert_eq!(
+            plan_effect(Target::Mobo, "static", None, Some(4))
+                .unwrap()
+                .mobo,
+            Some(MoboOp::Mode(MoboMode::Static))
+        );
         let plan = plan_effect(Target::All, "Color_Cycle", Some((1, 2, 3)), Some(2)).unwrap();
         assert_eq!(
             plan.gpu,
@@ -1116,6 +1236,36 @@ mod tests {
             server.hold.is_none(),
             "an explicit change supersedes the hold"
         );
+    }
+
+    #[test]
+    fn failed_restore_retains_baseline_retries_and_gives_up() {
+        let mut server = Server::new(true);
+        tool(&mut server, "aura_agent_state", json!({"state": "working"}));
+        server.fail_restore = true;
+        let idle = tool(&mut server, "aura_agent_state", json!({"state": "idle"}));
+        assert_eq!(idle["isError"], true);
+        let hold = server.hold.as_ref().unwrap();
+        assert!(hold.baseline.gpu.is_some());
+        assert!(hold.baseline.mobo.is_some());
+        assert_eq!(hold.restore_attempts, 1);
+        assert!(hold.deadline > Instant::now() + Duration::from_secs(4));
+        assert_eq!(server.hold_status()["state"], "restoring");
+        server.expire_if_due(Instant::now());
+        assert_eq!(server.hold.as_ref().unwrap().restore_attempts, 1);
+        server.fail_restore = false;
+        server.expire_if_due(server.next_deadline().unwrap());
+        assert!(server.hold.is_none());
+
+        tool(&mut server, "aura_agent_state", json!({"state": "working"}));
+        server.fail_restore = true;
+        for attempt in 1..=3 {
+            assert!(server.restore_baseline().is_err());
+            if attempt < 3 {
+                assert_eq!(server.hold.as_ref().unwrap().restore_attempts, attempt);
+            }
+        }
+        assert!(server.hold.is_none());
     }
 
     #[test]

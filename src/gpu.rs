@@ -63,6 +63,7 @@ impl LinuxI2c {
             .write(true)
             .open(path)
             .map_err(|error| device_error(path, error))?;
+        crate::hardware_lock::acquire(&file, path)?;
         // SAFETY: file owns a live fd; I2C_SLAVE takes an integer address.
         let result = unsafe { ioctl(file.as_raw_fd(), I2C_SLAVE, GPU_I2C_ADDR as c_ulong) };
         if result < 0 {

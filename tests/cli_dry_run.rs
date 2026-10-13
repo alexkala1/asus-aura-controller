@@ -136,3 +136,48 @@ fn invalid_speed_is_rejected_before_dispatch() {
     assert!(stderr.starts_with("error:"));
     assert!(stderr.contains("--speed"));
 }
+
+#[test]
+fn invalid_all_mode_is_a_clap_error_before_device_access() {
+    let output = Command::new(env!("CARGO_BIN_EXE_asus-aura-cli"))
+        .args(["all", "--color", "112233", "--mode", "invalid"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid mode"));
+}
+
+#[test]
+fn ignored_motherboard_color_warns_once_and_preserves_stdout() {
+    let output = dry_run(&["mobo", "--color", "112233", "--mode", "wave"]);
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stderr).unwrap(),
+        "warning: --color is ignored for effect modes; motherboard effects keep their stored colors\n");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        successful_stdout(&["mobo", "--mode", "wave"])
+    );
+}
+
+#[test]
+fn dry_run_needs_no_writable_runtime_directory() {
+    let dir = std::env::temp_dir().join(format!("aura-dry-environment-{}", std::process::id()));
+    assert!(!dir.exists());
+    for args in [
+        vec!["status"],
+        vec!["gpu", "--off"],
+        vec!["mobo", "--off"],
+        vec!["all", "--off"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_asus-aura-cli"))
+            .env("XDG_RUNTIME_DIR", &dir)
+            .env("TMPDIR", &dir)
+            .arg("--dry-run")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(!dir.exists());
+    }
+}
