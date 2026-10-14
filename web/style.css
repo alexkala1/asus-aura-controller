@@ -99,6 +99,13 @@ h1 span { color: var(--text-primary); }
 .zone-bar { display: flex; gap: 10px; list-style: none; padding: 0; margin: 0; }
 .zone-bar li { min-width: 0; flex: 1; color: var(--text-secondary); font: 10px var(--font-mono); text-align: center; }
 .zone-led { display: block; height: 6px; width: 100%; background: var(--zone-led, var(--led-off)); box-shadow: 0 0 12px var(--zone-led, var(--led-off)); border-radius: 3px; margin-bottom: 16px; }
+.zone-btn { display: block; width: 100%; min-height: 44px; padding: 8px 4px 4px; background: transparent; border: 1px solid transparent; border-radius: 5px; color: inherit; font: inherit; cursor: pointer; }
+.zone-btn .zone-led { margin-bottom: 8px; }
+.zone-btn[aria-pressed="true"] { background: var(--bg-selected); border-color: var(--color-accent); }
+.zone-btn[aria-pressed="true"] .zone-num { color: var(--text-primary); font-weight: 700; text-decoration: underline; }
+.zone-btn[aria-disabled="true"] { cursor: default; }
+.zone-edit { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 16px; min-height: 36px; }
+.zone-hint { margin: 0; color: var(--text-secondary); font-size: 12px; }
 .channel-card { --led: var(--led-off); --duration: 4s; min-width: 0; padding: 16px; background: transparent; border: 0; border-radius: 5px; }
 .channel-card.selected { background: var(--bg-selected); }
 .channel-header { display: flex; gap: 8px; justify-content: space-between; align-items: start; }
@@ -140,7 +147,7 @@ pre { margin: 20px 0; background: var(--bg-inset); border: 1px solid var(--borde
 footer { border-top: 1px solid var(--border-subtle); display: flex; justify-content: space-between; gap: 16px; padding: 24px 0; color: var(--text-secondary); font: 10px var(--font-mono); letter-spacing: 1px; }
 /* One state vocabulary covers every field, switch, and action. */
 @media (hover: hover) {
-  button:hover:not(:disabled), input:hover:not(:disabled), select:hover:not(:disabled), .color-field:has(input:hover:not(:disabled)) { background-color: var(--bg-hover); color: var(--text-primary); }
+  button:hover:not(:disabled):not([aria-disabled="true"]), input:hover:not(:disabled), select:hover:not(:disabled), .color-field:has(input:hover:not(:disabled)) { background-color: var(--bg-hover); color: var(--text-primary); }
   .switch-label:has(input:hover:not(:disabled)) .switch-track { background: var(--bg-hover); }
 }
 button:active:not(:disabled), input:active:not(:disabled), select:active:not(:disabled) { box-shadow: 0 0 0 2px var(--border-control); }

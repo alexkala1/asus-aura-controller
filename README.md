@@ -53,10 +53,13 @@ Always start with `--dry-run`: it exercises the same code paths, opens no device
 ./target/release/luminactl --dry-run --json status
 ./target/release/luminactl --dry-run gpu --color ff0055 --mode breathing
 ./target/release/luminactl --dry-run mobo --color 112233
+./target/release/luminactl --dry-run mobo --zone 2 --color ff0055   # one LED (0-3 Back I/O, 4 header), Static only
 ./target/release/luminactl --dry-run mobo --mode rainbow-breathing --speed 2
 ./target/release/luminactl --dry-run all --color 00ffcc --mode breathing
 ./target/release/luminactl --dry-run all --off
 ```
+
+Friendly mode names work on `gpu`, `mobo` and `all` alike: `strobing` = `flashing`, `comet` = `chase_fade`, `starry-night` / `flicker` = `random_flicker`, `color-cycle` = `spectrum`. The GPU only accepts the effects it can run. `--zone` sets one LED's static color and cannot be combined with `--off` or an effect mode; other LEDs keep their stored colors.
 
 For live control drop `--dry-run` (the motherboard needs root; see below). `--off` beats color and mode. GPU and motherboard modes default to static; motherboard speed is 0–4 where 0 is fastest. `--color` is required only for static mode: `all --mode rainbow` (also `rainbow-breathing`, `wave`, `rainbow-pulse`, `spectrum`, `starry-night`, ...) runs without one. With a color, color-driven motherboard effects (`breathing`, `flashing`, `chase`, `chase-fade`) store it as their effect color; effects that generate their own colors ignore it. The GPU's only autonomous effect is its color cycle (spectrum), so `rainbow`, `rainbow-breathing`, `wave` and `rainbow-pulse` run it there (`gpu --mode rainbow` is an alias); effects with no GPU equivalent fall back to static GPU color. Dry-run `status` prints canned values, not live readings.
 

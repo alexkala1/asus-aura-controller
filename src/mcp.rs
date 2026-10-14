@@ -69,7 +69,7 @@ const EFFECTS: [(&[&str], Option<GpuMode>, MoboMode); 13] = [
         MoboMode::RainbowPulse,
     ),
     (
-        &["starry-night", "random-flicker"],
+        &["starry-night", "random-flicker", "flicker"],
         None,
         MoboMode::RandomFlicker,
     ),

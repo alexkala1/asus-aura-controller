@@ -30,6 +30,11 @@ def set_color(page, selector, color):
 
 def apply_status(state, payload):
     """Model CLI device-wide semantics inside the test fixture only."""
+    if "zone" in payload:  # `mobo --zone N --color X`: one LED, static
+        mobo = state["data"]["motherboard"]
+        mobo.update(mode="static", color_configurable=True, color_source="direct")
+        mobo["zones"][payload["zone"]]["hex"] = payload["color"]
+        return
     if payload["target"] in ("all", "gpu"):
         gpu = state["data"]["gpu"]
         # GPU: its own modes, plus rainbow-style effects run its Spectrum color cycle.
@@ -55,7 +60,7 @@ def apply_status(state, payload):
 def daemon(page):
     state = {"data": copy.deepcopy(STATUS), "writes": [], "hold_status": False, "hold_apply": False,
              "pending_status": [], "pending_apply": [], "status_error": None, "apply_error": None,
-             "console_errors": [], "page_errors": []}
+             "console_errors": [], "page_errors": [], "fail_zones": set()}
     page.on("console", lambda msg: state["console_errors"].append(msg.text) if msg.type == "error" else None)
     page.on("pageerror", lambda error: state["page_errors"].append(str(error)))
 
@@ -75,6 +80,8 @@ def daemon(page):
                 state["pending_apply"].append(route)
             elif state["apply_error"]:
                 route.fulfill(json={"ok": False, "error": state["apply_error"]})
+            elif payload.get("zone") in state["fail_zones"]:
+                route.fulfill(status=400, json={"ok": False, "error": f"zone {payload['zone']} failed"})
             else:
                 apply_status(state, payload)
                 route.fulfill(json={"ok": True, "output": "Applied"})
@@ -367,7 +374,7 @@ def test_autonomous_status_ignores_black_buffers_and_needs_no_picker_color(page,
     expect(page.locator("#command-preview")).to_have_text("sudo luminactl gpu --mode spectrum")
     expect(page.locator("#btn-apply")).to_be_enabled()
     expect(page.locator('.zone-led[data-zone="0"]')).to_have_attribute("data-color", "")
-    expect(page.locator('.zone-led[data-zone="0"]')).to_have_attribute("aria-label", "Back I/O zone 0: automatic effect colors")
+    expect(page.locator('.zone-btn[data-zone="0"]')).to_have_attribute("aria-label", "Back I/O zone 0: automatic effect colors")
     page.locator("#sync-all").check()
     page.locator("#btn-apply").click()
     expect(page.locator("#status-toast")).to_have_text("✓ Applied to hardware.")
@@ -480,6 +487,160 @@ def test_board_strip_reads_each_zone_and_unified_color_writes_boardwide(page, da
     assert daemon["writes"][-1]["color"] == "334455"
     for zone in range(5):
         expect(page.locator(f'.zone-led[data-zone="{zone}"]')).to_have_attribute("data-color", "#334455")
+
+
+def zone_color(page, zone):
+    return page.locator(f'.zone-led[data-zone="{zone}"]').get_attribute("data-color")
+
+
+def test_selecting_a_zone_stages_and_applies_exactly_one_led(page, daemon):
+    page.goto(URL, wait_until="networkidle")
+    zone = page.locator('.zone-btn[data-zone="2"]')
+    expect(zone).to_have_attribute("aria-pressed", "false")
+    zone.click()
+    expect(zone).to_have_attribute("aria-pressed", "true")
+    expect(page.locator("#zone-hint")).to_contain_text("Editing Back I/O zone 2")
+    expect(page.locator("#mobo-color")).to_have_attribute("aria-label", "Motherboard lighting Back I/O zone 2 color")
+    set_color(page, "#mobo-color", "#ff0055")
+    assert [zone_color(page, i) for i in range(5)] == ["#00e5ff", "#00e5ff", "#ff0055", "#00e5ff", "#00e5ff"]
+    expect(page.locator('.zone-btn[data-zone="2"]')).to_have_attribute("aria-label", "Back I/O zone 2: #FF0055, staged")
+    expect(page.locator("#command-preview")).to_have_text("sudo luminactl mobo --zone 2 --color ff0055")
+    page.locator("#btn-apply").click()
+    expect(page.locator("#status-toast")).to_contain_text("Applied to hardware")
+    assert daemon["writes"] == [{"target": "mobo", "zone": 2, "color": "ff0055", "mode": "static"}]
+    # The refresh after Apply reads the hardware back: only that LED changed.
+    assert [zone_color(page, i) for i in range(5)] == ["#00e5ff", "#00e5ff", "#ff0055", "#00e5ff", "#00e5ff"]
+    expect(page.locator("#command-preview")).not_to_contain_text("--zone 2")
+
+
+def test_several_staged_zones_apply_in_order_and_survive_a_refresh(page, daemon):
+    page.goto(URL, wait_until="networkidle")
+    for zone, color in ((4, "#a855ff"), (1, "#00ff88")):
+        page.locator(f'.zone-btn[data-zone="{zone}"]').click()
+        set_color(page, "#mobo-color", color)
+    page.locator("#btn-refresh").click()
+    expect(page.locator("#btn-refresh")).to_have_text("Refresh devices")
+    assert (zone_color(page, 1), zone_color(page, 4)) == ("#00ff88", "#a855ff"), "staged colors must not be overwritten"
+    expect(page.locator("#command-preview")).to_have_text(
+        "sudo luminactl mobo --zone 1 --color 00ff88\nsudo luminactl mobo --zone 4 --color a855ff")
+    page.locator("#btn-apply").click()
+    expect(page.locator("#status-toast")).to_contain_text("Applied to hardware")
+    assert [(w["zone"], w["color"]) for w in daemon["writes"]] == [(1, "00ff88"), (4, "a855ff")]
+
+
+def test_zone_editing_is_keyboard_operable_and_unavailable_outside_static_or_sync(page, daemon):
+    page.goto(URL, wait_until="networkidle")
+    page.locator('.zone-btn[data-zone="3"]').focus()
+    page.keyboard.press("Enter")
+    expect(page.locator('.zone-btn[data-zone="3"]')).to_have_attribute("aria-pressed", "true")
+    page.keyboard.press("Space")  # a second press returns to editing the whole board
+    expect(page.locator('.zone-btn[data-zone="3"]')).to_have_attribute("aria-pressed", "false")
+    page.locator('.zone-btn[data-zone="3"]').click()
+    page.locator("#btn-all-zones").click()
+    expect(page.locator("#zone-hint")).to_contain_text("Editing all five LEDs")
+    # An effect clears the selection and disables zones with an explanation.
+    page.locator('.zone-btn[data-zone="3"]').click()
+    page.locator("#mobo-mode").select_option("rainbow")
+    expect(page.locator('.zone-btn[data-zone="3"]')).to_have_attribute("aria-pressed", "false")
+    expect(page.locator('.zone-btn[data-zone="3"]')).to_have_attribute("aria-disabled", "true")
+    expect(page.locator("#zone-hint")).to_have_text("Zone colors need the Static effect.")
+    page.locator('.zone-btn[data-zone="3"]').click(force=True)  # Playwright treats aria-disabled as not actionable
+    expect(page.locator('.zone-btn[data-zone="3"]')).to_have_attribute("aria-pressed", "false")
+    page.locator("#mobo-mode").select_option("static")
+    page.locator("#sync-all").check()
+    expect(page.locator("#zone-hint")).to_have_text("Zone colors are unavailable while Sync All is on.")
+    assert daemon["writes"] == []
+
+
+def test_a_board_wide_color_discards_staged_zone_colors(page, daemon):
+    page.goto(URL, wait_until="networkidle")
+    page.locator('.zone-btn[data-zone="0"]').click()
+    set_color(page, "#mobo-color", "#ff0055")
+    page.locator("#btn-all-zones").click()
+    set_color(page, "#mobo-color", "#334455")
+    assert {zone_color(page, i) for i in range(5)} == {"#334455"}
+    expect(page.locator("#command-preview")).to_have_text("sudo luminactl mobo --color 334455 --mode static --speed 0")
+
+
+def stage_zone(page, zone, color):
+    page.locator(f'.zone-btn[data-zone="{zone}"]').click()
+    set_color(page, "#mobo-color", color)
+
+
+def test_static_speed_edits_never_add_a_board_wide_color_write(page, daemon):
+    for i, zone in enumerate(daemon["data"]["motherboard"]["zones"]):
+        zone["hex"] = f"00000{i + 1}"
+    page.goto(URL, wait_until="networkidle")
+    stage_zone(page, 1, "#abcdef")
+    expect(page.locator("#mobo-speed")).to_be_disabled()
+    # Even a forced slider event is ignored: Static has no speed.
+    page.locator("#mobo-speed").evaluate("el => { el.value = 3; el.dispatchEvent(new Event('input', {bubbles: true})); }")
+    expect(page.locator("#command-preview")).to_have_text("sudo luminactl mobo --zone 1 --color abcdef")
+    page.locator("#btn-apply").click()
+    expect(page.locator("#status-toast")).to_contain_text("Applied to hardware")
+    assert daemon["writes"] == [{"target": "mobo", "zone": 1, "color": "abcdef", "mode": "static"}]
+    assert [zone_color(page, i) for i in range(5)] == ["#000001", "#abcdef", "#000003", "#000004", "#000005"]
+
+
+def test_an_explicit_board_color_is_written_before_later_zone_edits(page, daemon):
+    page.goto(URL, wait_until="networkidle")
+    set_color(page, "#mobo-color", "#112233")
+    stage_zone(page, 3, "#ff0055")
+    page.locator("#btn-apply").click()
+    expect(page.locator("#status-toast")).to_contain_text("Applied to hardware")
+    assert [(w.get("zone"), w["color"]) for w in daemon["writes"]] == [(None, "112233"), (3, "ff0055")]
+
+
+def test_refresh_keeps_staged_zones_when_the_board_changes_underneath(page, daemon):
+    page.goto(URL, wait_until="networkidle")
+    stage_zone(page, 1, "#abcdef")
+    mobo = daemon["data"]["motherboard"]
+    mobo.update(mode="rainbow", color_source="autonomous", color_configurable=False)
+    page.locator("#btn-refresh").click()
+    expect(page.locator("#btn-refresh")).to_have_text("Refresh devices")
+    expect(page.locator("#command-preview")).to_have_text("sudo luminactl mobo --zone 1 --color abcdef")
+    expect(page.locator("#zone-hint")).to_contain_text("Staged zone colors are kept")
+    expect(page.locator('.zone-btn[data-zone="1"]')).to_have_attribute("aria-label", "Back I/O zone 1: automatic effect colors, staged")
+    expect(page.locator("#btn-discard-zones")).to_be_visible()
+    page.locator("#btn-apply").click()  # recoverable: applying switches the board to Static
+    expect(page.locator("#status-toast")).to_contain_text("Applied to hardware")
+    assert daemon["writes"] == [{"target": "mobo", "zone": 1, "color": "abcdef", "mode": "static"}]
+    expect(page.locator("#btn-discard-zones")).to_be_hidden()
+
+
+def test_staged_zones_can_be_discarded_explicitly(page, daemon):
+    page.goto(URL, wait_until="networkidle")
+    stage_zone(page, 2, "#abcdef")
+    page.locator("#btn-discard-zones").click()
+    expect(page.locator("#status-toast")).to_have_text("Staged zone colors discarded.")
+    expect(page.locator("#btn-discard-zones")).to_be_hidden()
+    assert zone_color(page, 2) == "#00e5ff"
+    assert daemon["writes"] == []
+
+
+def test_choosing_an_effect_replaces_staged_zones_and_says_so(page, daemon):
+    page.goto(URL, wait_until="networkidle")
+    stage_zone(page, 2, "#abcdef")
+    page.locator("#mobo-mode").select_option("breathing")
+    expect(page.locator("#status-toast")).to_contain_text("Staged zone colors were replaced")
+    expect(page.locator("#btn-discard-zones")).to_be_hidden()
+    assert "--zone" not in page.locator("#command-preview").inner_text()
+
+
+def test_partial_zone_failure_leaves_only_the_unsent_zone_visible_and_retryable(page, daemon):
+    daemon["fail_zones"].add(2)
+    page.goto(URL, wait_until="networkidle")
+    stage_zone(page, 1, "#abcdef")
+    stage_zone(page, 2, "#123456")
+    page.locator("#btn-apply").click()
+    expect(page.locator("#status-toast")).to_contain_text("Apply failed")
+    expect(page.locator("#command-preview")).to_have_text("sudo luminactl mobo --zone 2 --color 123456")
+    expect(page.locator('.zone-btn[data-zone="1"]')).not_to_contain_text("staged")
+    expect(page.locator('.zone-btn[data-zone="2"]')).to_have_attribute("aria-label", "Back I/O zone 2: #123456, staged")
+    daemon["fail_zones"].clear()
+    page.locator("#btn-apply").click()
+    expect(page.locator("#status-toast")).to_contain_text("Applied to hardware")
+    assert [w["zone"] for w in daemon["writes"]] == [1, 2, 2]
 
 
 def test_vector_assets_and_locked_tokens():

@@ -47,17 +47,18 @@
         <header class="device-heading"><div><p class="eyebrow">02 / MOTHERBOARD</p><h2 id="mobo-title">ASUS ROG STRIX Z270E GAMING</h2><p class="hardware-address">0x02c0:0x4e · FW <span id="firmware">unverified</span></p></div><span id="mobo-state" class="device-state">Checking</span></header>
         <div class="board-map" aria-label="Onboard LED colors">
           <div class="zone-group"><h3>Back I/O</h3><ol class="zone-bar">
-            <li><span class="zone-led" data-zone="0"></span><span>0</span></li>
-            <li><span class="zone-led" data-zone="1"></span><span>1</span></li>
-            <li><span class="zone-led" data-zone="2"></span><span>2</span></li>
-            <li><span class="zone-led" data-zone="3"></span><span>3</span></li>
+            <li><button type="button" class="zone-btn" data-zone="0" aria-pressed="false" aria-disabled="true"><span class="zone-led" data-zone="0"></span><span class="zone-num">0</span></button></li>
+            <li><button type="button" class="zone-btn" data-zone="1" aria-pressed="false" aria-disabled="true"><span class="zone-led" data-zone="1"></span><span class="zone-num">1</span></button></li>
+            <li><button type="button" class="zone-btn" data-zone="2" aria-pressed="false" aria-disabled="true"><span class="zone-led" data-zone="2"></span><span class="zone-num">2</span></button></li>
+            <li><button type="button" class="zone-btn" data-zone="3" aria-pressed="false" aria-disabled="true"><span class="zone-led" data-zone="3"></span><span class="zone-num">3</span></button></li>
           </ol></div>
           <div class="zone-group header-zone"><h3>RGB Header</h3><ol class="zone-bar" start="4">
-            <li><span class="zone-led" data-zone="4"></span><span>4</span></li>
+            <li><button type="button" class="zone-btn" data-zone="4" aria-pressed="false" aria-disabled="true"><span class="zone-led" data-zone="4"></span><span class="zone-num">4</span></button></li>
           </ol></div>
         </div>
+        <div class="zone-edit"><p id="zone-hint" class="zone-hint" role="status"></p><button id="btn-all-zones" class="btn btn-secondary" type="button" hidden>Edit all zones</button><button id="btn-discard-zones" class="btn btn-secondary" type="button" hidden>Discard staged zones</button></div>
         <div id="mobo-controls"></div>
-        <p class="device-footnote">One color and effect across all five onboard LEDs.</p>
+        <p class="device-footnote">Effects and speed apply to all five onboard LEDs. With Static, select a zone to color it on its own.</p>
       </section>
     </section>
 
@@ -70,7 +71,7 @@
         <div id="status-toast" class="toast" role="status" aria-live="polite"></div>
       </div>
       <p id="command-note">Choose a verified device to stage a hardware command.</p>
-      <p class="command-help">Motherboard controls apply to every onboard LED. Effect modes retain the device's existing effect colors. Sync All uses the CLI's default effect speed.</p>
+      <p class="command-help">Motherboard controls apply to every onboard LED unless a zone is selected. Effect modes retain the device's existing effect colors. Sync All uses the CLI's default effect speed.</p>
     </section>
     <footer><span>LUMINA LIGHTING STUDIO</span><span>LOCAL DAEMON / :7890</span></footer>
   </main>

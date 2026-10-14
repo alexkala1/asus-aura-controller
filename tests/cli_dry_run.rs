@@ -347,3 +347,37 @@ fn mobo_color_with_an_autonomous_effect_warns_and_keeps_stored_colors() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(!mobo_writes(&stdout).iter().any(|w| w.starts_with("0x8010")));
 }
+
+#[test]
+fn mobo_zone_writes_only_that_leds_color_in_red_blue_green_order() {
+    let stdout = successful_stdout(&["mobo", "--zone", "4", "--color", "#112233"]);
+    let writes = mobo_writes(&stdout);
+    // Zone 4's direct buffer is 0x800c..0x800e, stored red, blue, green.
+    for expected in ["0x800c <= 0x11", "0x800d <= 0x33", "0x800e <= 0x22"] {
+        assert!(
+            writes.iter().any(|w| w == expected),
+            "{expected} in {writes:?}"
+        );
+    }
+    assert!(
+        !writes.iter().any(|w| w.starts_with("0x8000")),
+        "zone 0 must be untouched"
+    );
+    assert!(stdout.contains("[MOBO] Zone 4 set to #112233."));
+}
+
+#[test]
+fn mobo_zone_is_rejected_with_effects_off_or_out_of_range_before_any_write() {
+    for args in [
+        ["mobo", "--zone", "1", "--color", "ff0000", "--mode", "wave"].as_slice(),
+        ["mobo", "--zone", "1", "--color", "ff0000", "--off"].as_slice(),
+        ["mobo", "--zone", "5", "--color", "ff0000"].as_slice(),
+    ] {
+        let output = dry_run(args);
+        assert!(!output.status.success(), "{args:?}");
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("[DRY-RUN]"),
+            "{args:?}"
+        );
+    }
+}

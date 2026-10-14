@@ -45,6 +45,9 @@ enum Command {
         mode: MoboMode,
         #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=4))]
         speed: u8,
+        /// Set one onboard LED (0-3 Back I/O, 4 RGB header); static color only.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=4), requires = "color", conflicts_with = "off")]
+        zone: Option<u8>,
         #[arg(long)]
         off: bool,
     },
@@ -59,13 +62,16 @@ enum Command {
     },
 }
 
-/// GPU modes by name, plus the cross-device effect names that map onto the GPU's
-/// built-in color cycle: its only autonomous effect.
+/// GPU modes by name. Only effects the GPU can run are accepted: its color cycle
+/// (`rainbow`, `color-cycle`, `spectrum`) and `strobing` for its flashing mode.
 fn parse_gpu_mode(name: &str) -> Result<GpuMode, String> {
-    let normalized = name.replace('_', "-");
+    let normalized = name.to_ascii_lowercase().replace('_', "-");
     match normalized.as_str() {
         "rainbow" | "color-cycle" => Ok(GpuMode::Spectrum),
-        _ => GpuMode::from_str(&normalized, false),
+        "strobing" => Ok(GpuMode::Flashing),
+        _ => GpuMode::from_str(&normalized, false).map_err(|_| {
+            format!("'{name}' is not a GPU effect (GPU: static, breathing, flashing/strobing, spectrum/color-cycle/rainbow, off)")
+        }),
     }
 }
 
@@ -81,12 +87,18 @@ fn resolve_all_mode(mode: &str) -> (GpuMode, MoboMode) {
         })
 }
 
+/// Motherboard modes by native name or by any friendly alias from the shared effect
+/// table (`comet`, `strobing`, `starry-night`, `flicker`, ...).
 fn parse_mobo_mode(name: &str) -> Result<MoboMode, String> {
-    MoboMode::from_str(&name.replace('_', "-"), false)
+    let normalized = name.to_ascii_lowercase().replace('_', "-");
+    match mcp::find_effect(&normalized) {
+        Some((_, mobo, _)) => Ok(mobo),
+        None => MoboMode::from_str(&normalized, false),
+    }
 }
 
 fn parse_all_mode(name: &str) -> Result<String, String> {
-    let normalized = name.replace('_', "-");
+    let normalized = name.to_ascii_lowercase().replace('_', "-");
     if mcp::find_effect(&normalized).is_some()
         || GpuMode::from_str(&normalized, false).is_ok()
         || parse_mobo_mode(&normalized).is_ok()
@@ -200,8 +212,24 @@ pub fn run(cli: Cli) -> Result<String, String> {
             color,
             mode,
             speed,
+            zone,
             off,
         } => {
+            if let Some(zone) = zone {
+                if mode != MoboMode::Static {
+                    return Err(
+                        "--zone sets one LED's static color; effect modes drive every LED together"
+                            .to_owned(),
+                    );
+                }
+                let color = color.as_deref().ok_or("--zone requires --color")?;
+                let (r, g, b) = parse_hex_color(color)?;
+                mobo_controller(dry)?.set_zone_color(zone, r, g, b)?;
+                return Ok(format!(
+                    "[MOBO] Zone {zone} set to #{}.",
+                    color.trim_start_matches('#')
+                ));
+            }
             if off {
                 mobo_controller(dry)?.set_mode(MoboMode::Off, 0, 0)?;
                 return Ok("[MOBO] LEDs turned off.".to_owned());
@@ -373,6 +401,97 @@ mod cli_tests {
                 Cli::try_parse_from(["luminactl", "--dry-run", "gpu", "--mode", mode]).unwrap();
             assert_eq!(run(cli).unwrap(), "[GPU] Mode set to spectrum.", "{mode}");
         }
+    }
+
+    #[test]
+    fn friendly_aliases_resolve_identically_on_gpu_mobo_and_all() {
+        for (args, expected) in [
+            (
+                vec!["mobo", "--mode", "comet"],
+                "[MOBO] Mode set to chase_fade (Speed: 0).",
+            ),
+            (
+                vec!["mobo", "--mode", "strobing"],
+                "[MOBO] Mode set to flashing (Speed: 0).",
+            ),
+            (
+                vec!["mobo", "--mode", "starry-night"],
+                "[MOBO] Mode set to random_flicker (Speed: 0).",
+            ),
+            (
+                vec!["mobo", "--mode", "flicker"],
+                "[MOBO] Mode set to random_flicker (Speed: 0).",
+            ),
+            (
+                vec!["mobo", "--mode", "Color_Cycle"],
+                "[MOBO] Mode set to spectrum (Speed: 0).",
+            ),
+            (
+                vec!["gpu", "--mode", "strobing"],
+                "[GPU] Mode set to flashing.",
+            ),
+        ] {
+            let cli =
+                Cli::try_parse_from(["luminactl", "--dry-run"].into_iter().chain(args)).unwrap();
+            assert_eq!(run(cli).unwrap(), expected);
+        }
+        // `all` resolves the same names, with the GPU falling back where it has no equivalent.
+        for mode in ["comet", "strobing", "starry-night", "flicker"] {
+            let cli =
+                Cli::try_parse_from(["luminactl", "--dry-run", "all", "--mode", mode]).unwrap();
+            assert!(run(cli).is_ok(), "{mode}");
+        }
+        // The GPU still refuses effects it cannot run.
+        for mode in ["comet", "starry-night", "wave"] {
+            assert!(
+                Cli::try_parse_from(["luminactl", "gpu", "--mode", mode]).is_err(),
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn zone_sets_one_led_and_rejects_unsupported_combinations() {
+        let cli = Cli::try_parse_from([
+            "luminactl",
+            "--dry-run",
+            "mobo",
+            "--zone",
+            "2",
+            "--color",
+            "#FF0055",
+        ])
+        .unwrap();
+        assert_eq!(run(cli).unwrap(), "[MOBO] Zone 2 set to #FF0055.");
+        for args in [
+            vec!["mobo", "--zone", "5", "--color", "ff0055"],
+            vec!["mobo", "--zone", "-1", "--color", "ff0055"],
+            vec!["mobo", "--zone", "1"],
+            vec!["mobo", "--zone", "1", "--color", "ff0055", "--off"],
+        ] {
+            let all = ["luminactl"].into_iter().chain(args.clone());
+            assert!(Cli::try_parse_from(all).is_err(), "{args:?}");
+        }
+        // Effects drive every LED together, so a zone cannot be combined with them.
+        let cli = Cli::try_parse_from([
+            "luminactl",
+            "--dry-run",
+            "mobo",
+            "--zone",
+            "1",
+            "--color",
+            "ff0055",
+            "--mode",
+            "breathing",
+        ])
+        .unwrap();
+        assert!(run(cli)
+            .unwrap_err()
+            .contains("--zone sets one LED's static color"));
+        // A bad color is reported before any device is opened.
+        let cli =
+            Cli::try_parse_from(["luminactl", "mobo", "--zone", "1", "--color", "zzz"]).unwrap();
+        assert!(run(cli).unwrap_err().contains("6 hexadecimal digits"));
     }
 
     #[test]

@@ -201,6 +201,7 @@ class LuminaRequestHandler(http.server.SimpleHTTPRequestHandler):
         color = req.get("color", "")
         mode = req.get("mode", "static")
         speed = req.get("speed", 0)
+        zone = req.get("zone")
 
         if target not in ("gpu", "mobo", "all"):
             self.send_json_response(400, {"ok": False, "error": "Unknown hardware target."})
@@ -212,6 +213,20 @@ class LuminaRequestHandler(http.server.SimpleHTTPRequestHandler):
         if color and (len(color) != 6 or any(c not in "0123456789abcdefABCDEF" for c in color)):
             self.send_json_response(400, {"ok": False, "error": "Color must contain six hexadecimal digits."})
             return
+        if zone is not None:
+            # One LED's static color: bool is an int subclass, so rule it out explicitly.
+            if type(zone) is not int or not 0 <= zone <= 4:
+                self.send_json_response(400, {"ok": False, "error": "Zone must be an integer from 0 to 4."})
+                return
+            if target != "mobo":
+                self.send_json_response(400, {"ok": False, "error": "Zones apply to the motherboard target only."})
+                return
+            if is_off or mode != "static":
+                self.send_json_response(400, {"ok": False, "error": "A zone takes a static color only; it cannot be combined with off or an effect."})
+                return
+            if not color:
+                self.send_json_response(400, {"ok": False, "error": "A color is required to set a zone."})
+                return
         if not is_off and not color and mode == "static":
             # Effects that generate their own colors need none; static always does.
             self.send_json_response(400, {"ok": False, "error": "A color is required for static mode."})
@@ -219,7 +234,9 @@ class LuminaRequestHandler(http.server.SimpleHTTPRequestHandler):
         cmd = ["sudo", "-n", str(CLI_BIN)]
         cmd.append(target)
 
-        if is_off:
+        if zone is not None:
+            cmd.extend(["--zone", str(zone), "--color", color])
+        elif is_off:
             cmd.append("--off")
         else:
             if color:

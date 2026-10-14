@@ -313,6 +313,32 @@ def test_autonomous_modes_apply_without_a_color_but_static_still_needs_one(start
     assert len(server_module.calls) == before
 
 
+def test_zone_apply_passes_zone_and_color_to_the_cli_and_rejects_bad_combinations(start, server_module):
+    port = start()
+    body = json.dumps({"target": "mobo", "zone": 3, "color": "#00FFCC", "mode": "static", "speed": 2}).encode()
+    assert status_of(exchange(port, post(f"Content-Length: {len(body)}\r\n", body))) == 200
+    # A zone command never carries --speed or --mode: it is one LED's static color.
+    assert server_module.calls[-1][-5:] == ["mobo", "--zone", "3", "--color", "00FFCC"]
+    assert "--speed" not in server_module.calls[-1]
+    before = len(server_module.calls)
+    for bad in (
+        {"target": "mobo", "zone": 5, "color": "ff0000"},
+        {"target": "mobo", "zone": -1, "color": "ff0000"},
+        {"target": "mobo", "zone": True, "color": "ff0000"},
+        {"target": "mobo", "zone": "1", "color": "ff0000"},
+        {"target": "mobo", "zone": 1.0, "color": "ff0000"},
+        {"target": "gpu", "zone": 1, "color": "ff0000"},
+        {"target": "all", "zone": 1, "color": "ff0000"},
+        {"target": "mobo", "zone": 1, "color": "ff0000", "off": True},
+        {"target": "mobo", "zone": 1, "color": "ff0000", "mode": "breathing"},
+        {"target": "mobo", "zone": 1},
+        {"target": "mobo", "zone": 1, "color": "zzzzzz"},
+    ):
+        payload = json.dumps(bad).encode()
+        assert status_of(exchange(port, post(f"Content-Length: {len(payload)}\r\n", payload))) == 400, bad
+    assert len(server_module.calls) == before, "no rejected request may reach the CLI"
+
+
 @pytest.mark.parametrize("method, path", [("GET", "/"), ("GET", "/app.js"), ("HEAD", "/style.css"),
                                           ("GET", "/not-found"), ("GET", "/api/status"), ("OPTIONS", "/api/apply")])
 def test_every_daemon_response_disables_caching(start, method, path):

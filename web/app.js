@@ -18,6 +18,12 @@ const channels = [
   { id: "mobo", name: "Motherboard lighting", tag: "5 LEDs", color: null, mode: "static", speed: 0 },
 ];
 let zoneColors = Array(5).fill(null);
+// null edits the whole board; a number edits that one LED (Static only).
+let activeZone = null;
+const zoneDirty = new Set(); // zones with a staged color the hardware does not have yet
+// True only when the user chose a board-wide color (or Static). Other motherboard edits mark
+// the device dirty without implying an RGB write that would overwrite individual zones.
+let boardColorStaged = false;
 const $ = selector => document.querySelector(selector);
 let active = channels[0];
 let connected = false;
@@ -31,6 +37,8 @@ function effectiveMode(channel) {
   const mode = nativeMode(channel);
   return channel.id !== "gpu" ? mode : gpuSpectrumModes.has(mode) ? "spectrum" : gpuModes.has(mode) ? mode : "static";
 }
+// Speed reaches the hardware only for motherboard effects; Static, Off and the GPU ignore it.
+const speedApplies = channel => channel.id !== "gpu" && channel.mode !== "static" && channel.mode !== "off";
 const configurableColor = channel => channel.mode !== "off" && colorModes.has(effectiveMode(channel));
 const autonomousColor = channel => channel.mode !== "off" && !configurableColor(channel);
 let refreshing = false;
@@ -38,6 +46,13 @@ const sync = $("#sync-all");
 const apply = $("#btn-apply");
 const copy = $("#btn-copy");
 const refresh = $("#btn-refresh");
+const allZones = $("#btn-all-zones");
+const discardZones = $("#btn-discard-zones");
+const zoneButtons = [...document.querySelectorAll(".zone-btn")];
+const zoneName = index => `${index < 4 ? "Back I/O" : "RGB Header"} zone ${index}`;
+// Zones need a settled, unlinked board in Static; a pending apply only pauses edits.
+const zonesAvailable = () => connected && !sync.checked && channels[1].mode === "static";
+const zonesEditable = () => zonesAvailable() && !busy && !refreshing;
 
 for (const channel of channels) {
   const card = $("#channel-template").content.firstElementChild.cloneNode(true);
@@ -60,13 +75,35 @@ for (const channel of channels) {
   const update = (key, value) => {
     if (!connected || busy) return;
     active = channel;
-    channel[key] = value;
+    if (key === "color" && channel.id === "mobo" && activeZone !== null && zonesAvailable()) {
+      zoneColors[activeZone] = value;
+      zoneDirty.add(activeZone);
+      setControlState("default");
+      notify(`${zoneName(activeZone)} staged. Apply to update hardware.`, "default");
+      render();
+      return;
+    }
     // The CLI writes motherboard settings device-wide, never per zone.
     const linked = sync.checked ? channels : [channel];
+    // Static ignores speed in the driver: staging it would only mark the board dirty.
+    if (key === "speed" && linked.every(target => !speedApplies(target))) return;
+    channel[key] = value;
+    let replacedZones = false;
     for (const target of linked) {
       target[key] = value;
-      if (key === "color" && target.id === "mobo") zoneColors.fill(value);
+      if (key === "color" && target.id === "mobo") {
+        replacedZones ||= zoneDirty.size > 0;
+        zoneColors.fill(value);
+        zoneDirty.clear();
+        boardColorStaged = true;
+      }
       if (key === "mode") target.nativeMode = null;
+      if (key === "mode" && target.id === "mobo") {
+        activeZone = null;
+        // An explicit effect choice replaces staged zones; Static keeps them (zones are Static-only).
+        if (value !== "static") { replacedZones ||= zoneDirty.size > 0; zoneDirty.clear(); boardColorStaged = false; }
+        else if (!zoneDirty.size) boardColorStaged = true;
+      }
       // Static needs an explicit staged color even when the first status was autonomous.
       if (key === "mode" && effectiveMode(target) === "static" && !target.color) {
         target.color = "#ffffff";
@@ -75,7 +112,7 @@ for (const channel of channels) {
     }
     for (const target of linked) dirty[deviceKey(target)] = true;
     setControlState("default");
-    notify("Changes staged. Apply to update hardware.", "default");
+    notify(replacedZones ? "Staged zone colors were replaced. Apply to update hardware." : "Changes staged. Apply to update hardware.", "default");
     render();
   };
   card.querySelector(".color-picker").addEventListener("input", event => update("color", event.target.value));
@@ -102,7 +139,7 @@ function lockControls() {
     for (const input of channel.card.querySelectorAll("input, select")) input.disabled = !connected || busy;
     channel.card.querySelector(".color-picker").disabled = !connected || busy || !configurableColor(channel)
       || (sync.checked && !colorModes.has(nativeMode(channel)));
-    if (channel.id === "gpu") channel.card.querySelector(".speed-slider").disabled = true;
+    if (!speedApplies(channel)) channel.card.querySelector(".speed-slider").disabled = true;
   }
   sync.disabled = !connected || busy;
   apply.disabled = !connected || busy || refreshing;
@@ -114,12 +151,15 @@ function render() {
   for (const channel of channels) {
     const card = channel.card;
     const autonomous = autonomousColor(channel);
-    card.style.setProperty("--led", autonomous ? "var(--color-accent)" : channel.color || "var(--led-off)");
+    const zoned = channel.id === "mobo" && activeZone !== null;
+    const shown = zoned ? zoneColors[activeZone] : channel.color;
+    card.querySelector(".color-picker").setAttribute("aria-label", `${channel.name}${zoned ? ` ${zoneName(activeZone)}` : ""} color`);
+    card.style.setProperty("--led", autonomous ? "var(--color-accent)" : shown || "var(--led-off)");
     card.style.setProperty("--duration", `${3 + channel.speed * 1.5}s`);
     card.dataset.mode = connected ? channel.mode : "off";
     card.dataset.colorSource = autonomous ? "autonomous" : "configured";
-    if (channel.color) card.querySelector(".color-picker").value = channel.color;
-    card.querySelector(".hex-value").textContent = channel.mode === "off" ? "Off" : autonomous ? "Auto" : channel.color ? channel.color.toUpperCase() : "—";
+    if (shown) card.querySelector(".color-picker").value = shown;
+    card.querySelector(".hex-value").textContent = channel.mode === "off" ? "Off" : autonomous ? "Auto" : shown ? shown.toUpperCase() : "—";
     card.querySelector(".mode-picker").value = channel.mode;
     card.querySelector(".speed-slider").value = channel.speed;
     card.querySelector(".speed-value").textContent = channel.id === "gpu" ? "Fixed" : channel.speed;
@@ -133,15 +173,78 @@ function render() {
     element.style.setProperty("--zone-led", led({ ...motherboard, color }));
     element.dataset.color = autonomous ? "" : color || "";
     element.dataset.colorSource = autonomous ? "autonomous" : "configured";
-    element.setAttribute("role", "img");
-    element.setAttribute("aria-label", `${index < 4 ? "Back I/O" : "RGB Header"} zone ${index}: ${motherboard.mode === "off" ? "off" : autonomous ? "automatic effect colors" : !color ? "unverified" : color.toUpperCase()}`);
+    const button = zoneButtons[index];
+    button.setAttribute("aria-label", `${zoneName(index)}: ${motherboard.mode === "off" ? "off" : autonomous ? "automatic effect colors" : !color ? "unverified" : color.toUpperCase()}${zoneDirty.has(index) ? ", staged" : ""}`);
+    button.setAttribute("aria-pressed", String(activeZone === index));
+    button.setAttribute("aria-disabled", String(!zonesEditable()));
   });
+  renderZoneHint();
   $(".board-map").dataset.mode = motherboard.mode;
   $(".board-map").style.setProperty("--duration", `${3 + motherboard.speed * 1.5}s`);
   $("#sync-state").textContent = sync.checked ? "Both devices linked" : "Control each device independently";
   markActive();
   renderCommand();
   lockControls();
+}
+
+function renderZoneHint() {
+  allZones.hidden = activeZone === null;
+  allZones.disabled = busy;
+  discardZones.hidden = zoneDirty.size === 0;
+  discardZones.disabled = busy;
+  let hint = "";
+  if (connected) {
+    if (sync.checked) hint = "Zone colors are unavailable while Sync All is on.";
+    else if (zoneDirty.size && channels[1].mode !== "static") hint = `The board is now running ${channels[1].mode}. Staged zone colors are kept; applying them switches the board to Static. Discard them to keep the effect.`;
+    else if (channels[1].mode !== "static") hint = "Zone colors need the Static effect.";
+    else if (activeZone === null) hint = "Editing all five LEDs. Select a zone to color it on its own.";
+    else hint = `Editing ${zoneName(activeZone)}. The other LEDs keep their colors.${zoneDirty.has(activeZone) ? "" : " Pick a color to stage it."}`;
+  }
+  $("#zone-hint").textContent = hint;
+}
+
+function selectZone(index) {
+  if (!zonesEditable()) return;
+  activeZone = activeZone === index ? null : index;
+  active = channels[1];
+  render();
+}
+zoneButtons.forEach((button, index) => button.addEventListener("click", () => selectZone(index)));
+allZones.addEventListener("click", () => { activeZone = null; render(); });
+discardZones.addEventListener("click", () => {
+  zoneDirty.clear();
+  activeZone = null;
+  notify("Staged zone colors discarded.", "default");
+  // Show what the hardware really has again.
+  refreshStatus();
+});
+
+// Staged zone colors, one request each: the CLI sets a single LED per command.
+function zonePayloads() {
+  return [...zoneDirty].sort().map(zone => ({ target: "mobo", zone, color: zoneColors[zone].slice(1), mode: "static" }));
+}
+
+// What Apply sends, in order: the staged device-wide change first, then any staged zones.
+function requests() {
+  const wide = selection();
+  const zones = active.id === "mobo" && !sync.checked ? zonePayloads() : [];
+  if (!zones.length) return [wide];
+  // A board-wide write precedes zones only when one was asked for: an effect/mode change, or an
+  // explicit board color. Anything else would repaint LEDs the user never touched.
+  const wideRequested = dirty.mobo && (boardColorStaged || channels[1].mode !== "static");
+  return wideRequested ? [wide, ...zones] : zones;
+}
+
+function commandLine({ target, zone, mode, color, speed, off }) {
+  const args = ["sudo", "luminactl", target];
+  if (zone !== undefined) args.push("--zone", zone, "--color", color);
+  else if (off) args.push("--off");
+  else {
+    if (color) args.push("--color", color);
+    args.push("--mode", mode);
+    if (target === "mobo") args.push("--speed", speed);
+  }
+  return args.join(" ");
 }
 
 function selection() {
@@ -182,17 +285,12 @@ function renderCommand() {
     return;
   }
   const chosen = selection();
-  const { target, mode, color, speed, off } = chosen;
-  const args = ["sudo", "luminactl", target];
-  if (off) args.push("--off");
-  else {
-    if (color) args.push("--color", color);
-    args.push("--mode", mode);
-    if (target === "mobo") args.push("--speed", speed);
-  }
-  $("#command-preview").textContent = args.join(" ");
+  const list = requests();
+  $("#command-preview").textContent = list.map(commandLine).join("\n");
   $("#command-target").textContent = sync.checked ? "Both devices" : active.name;
-  $("#command-note").textContent = commandNote(chosen);
+  $("#command-note").textContent = list.some(request => request.zone !== undefined)
+    ? "Sets one motherboard LED per command; the other LEDs keep their colors."
+    : commandNote(chosen);
 }
 
 function notify(message, state) {
@@ -273,9 +371,15 @@ async function refreshStatus() {
     }
     if (!dirty.mobo) {
       Object.assign(channels[1], { mode: moboMode, nativeMode: mobo.color_source === "direct" ? "static" : mobo.mode.replaceAll("_", "-"), speed: mobo.speed });
+      // The board changed under us: drop the zone selection but keep staged colors so the
+      // user can apply or discard them (see the zone hint).
+      if (moboMode !== "static") activeZone = null;
       if (mobo.color_source !== "autonomous" && hasConfiguredColor(mobo, channels[1])) {
-        zoneColors = mobo.zones.map(zone => `#${zone.hex}`);
-        channels[1].color = zoneColors[0];
+        const hardware = mobo.zones.map(zone => `#${zone.hex}`);
+        channels[1].color = hardware[0];
+        // Staged zone colors survive the periodic refresh until they are applied.
+        for (const zone of zoneDirty) hardware[zone] = zoneColors[zone];
+        zoneColors = hardware;
       }
     }
     connected = true;
@@ -306,7 +410,7 @@ async function refreshStatus() {
 
 apply.addEventListener("click", async () => {
   if (!connected || busy || refreshing) return;
-  const { mapped, ...payload } = selection(); // `mapped` is display-only
+  const list = requests();
   busy = true;
   setControlState("loading");
   lockControls();
@@ -314,11 +418,17 @@ apply.addEventListener("click", async () => {
   notify("Writing lighting settings to hardware…", "loading");
   let succeeded = false;
   try {
-    await api("/api/apply", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-    const applied = payload.target === "all" ? channels : [channels[payload.target === "gpu" ? 0 : 1]];
-    for (const channel of applied) dirty[deviceKey(channel)] = false;
+    for (const { mapped, ...payload } of list) { // `mapped` is display-only
+      await api("/api/apply", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      // Clear staging per request so a later failure leaves only the unsent ones staged.
+      if (payload.zone !== undefined) zoneDirty.delete(payload.zone);
+      else {
+        for (const channel of payload.target === "all" ? channels : [channels[payload.target === "gpu" ? 0 : 1]]) dirty[deviceKey(channel)] = false;
+        if (payload.target !== "gpu") boardColorStaged = false;
+      }
+    }
     succeeded = true;
-    const pending = channels.find(channel => dirty[deviceKey(channel)]);
+    const pending = channels.find(channel => dirty[deviceKey(channel)]) || (zoneDirty.size ? channels[1] : null);
     if (pending) {
       // Point the next Apply at the device that is still staged.
       active = pending;
@@ -333,7 +443,9 @@ apply.addEventListener("click", async () => {
   } finally {
     busy = false;
     apply.textContent = "Apply to hardware";
-    lockControls();
+    // Redraw preview, selection and staged markers: after a partial failure only the unsent
+    // zones may remain visible.
+    render();
   }
   if (succeeded) await refreshStatus();
 });
@@ -353,6 +465,9 @@ sync.addEventListener("change", () => {
   if (sync.checked) {
     for (const channel of channels) Object.assign(channel, { color: active.color, mode: active.mode, nativeMode: active.nativeMode, speed: active.speed });
     zoneColors.fill(active.color);
+    activeZone = null;
+    zoneDirty.clear();
+    boardColorStaged = true;
     dirty.gpu = dirty.mobo = true; // linking stages the mirrored settings on both devices
   }
   setControlState("default");

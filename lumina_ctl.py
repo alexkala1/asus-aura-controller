@@ -102,7 +102,7 @@ GPU_ALIASES = {"rainbow": "spectrum", "color-cycle": "spectrum", "strobing": "fl
 MOBO_ALIASES = {
     "color-cycle": "spectrum", "strobing": "flashing", "comet": "chase_fade",
     "flash-and-dash": "spectrum_chase_fade", "glowing-yoyo": "rainbow_pulse",
-    "starry-night": "random_flicker",
+    "starry-night": "random_flicker", "flicker": "random_flicker",
 }
 # Rainbow-style effects run the GPU's only autonomous effect: its Spectrum color cycle.
 GPU_SPECTRUM_FOR = {"rainbow", "rainbow_breathing", "wave", "rainbow_pulse"}
