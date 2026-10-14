@@ -31,6 +31,30 @@ CONNECTION_DEADLINE = 30.0      # hard cap on one connection, however slowly it 
 MAX_ACTIVE_HANDLERS = 16        # further connections get an immediate 503
 
 
+# Effects each device can physically run, in the Studio's vocabulary (mirrors the CLI's
+# `supported_modes`; used for legacy binaries and to validate /api/apply).
+GPU_MODES = ("static", "breathing", "strobing", "rainbow", "off")
+MOBO_MODES = ("static", "breathing", "strobing", "color-cycle", "rainbow", "comet", "flash-and-dash",
+              "wave", "glowing-yoyo", "starry-night", "off")
+# Spellings each device's CLI accepts (src/main.rs parse_gpu_mode / parse_mobo_mode); a request
+# is validated against exactly these so nothing passes here that the CLI then rejects.
+GPU_SPELLINGS = {"static": "static", "breathing": "breathing", "flashing": "strobing", "strobing": "strobing",
+                 "spectrum": "rainbow", "color-cycle": "rainbow", "rainbow": "rainbow"}
+_MOBO_ALIASES = {"flashing": "strobing", "spectrum": "color-cycle", "chase-fade": "comet", "chase": "comet",
+                 "spectrum-chase-fade": "flash-and-dash", "spectrum-chase": "flash-and-dash",
+                 "rainbow-pulse": "glowing-yoyo", "random-flicker": "starry-night", "flicker": "starry-night",
+                 "rainbow-breathing": "rainbow-breathing"}
+
+
+def device_mode(device, name):
+    """Canonical supported mode `name` means on `device`, or None if the hardware or CLI cannot take it."""
+    n = name.strip().lower().replace("_", "-")
+    if device == "gpu":
+        return GPU_SPELLINGS.get(n)
+    n = _MOBO_ALIASES.get(n, n)
+    return n if n == "rainbow-breathing" or (n in MOBO_MODES and n != "off") else None
+
+
 class RequestError(Exception):
     def __init__(self, code, message):
         super().__init__(message)
@@ -174,6 +198,9 @@ class LuminaRequestHandler(http.server.SimpleHTTPRequestHandler):
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
             if r.returncode == 0:
                 data = json.loads(r.stdout)
+                for key, modes in (("gpu", GPU_MODES), ("motherboard", MOBO_MODES)):
+                    if isinstance(data, dict) and isinstance(data.get(key), dict):
+                        data[key].setdefault("supported_modes", list(modes))
                 self.send_json_response(200, {"ok": True, "mode": "live", "data": data})
             else:
                 self.send_json_response(503, {"ok": False, "error": r.stderr.strip() or "Hardware status unavailable."})
@@ -226,6 +253,13 @@ class LuminaRequestHandler(http.server.SimpleHTTPRequestHandler):
                 return
             if not color:
                 self.send_json_response(400, {"ok": False, "error": "A color is required to set a zone."})
+                return
+        if not is_off and mode:
+            devices = ("gpu", "mobo") if target == "all" else (target,)
+            unsupported = [d for d in devices if device_mode(d, mode) is None]
+            if unsupported:
+                names = {"gpu": "The GPU", "mobo": "The motherboard"}
+                self.send_json_response(400, {"ok": False, "error": f"{names[unsupported[0]]} does not support the '{mode}' effect."})
                 return
         if not is_off and not color and mode == "static":
             # Effects that generate their own colors need none; static always does.

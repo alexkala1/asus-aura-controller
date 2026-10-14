@@ -381,3 +381,32 @@ fn mobo_zone_is_rejected_with_effects_off_or_out_of_range_before_any_write() {
         );
     }
 }
+
+#[test]
+fn status_json_lists_only_the_effects_each_device_supports() {
+    let stdout = successful_stdout(&["status", "--json"]);
+    let data: serde_json::Value = serde_json::from_str(&stdout).expect("pure JSON stdout");
+    let modes = |key: &str| -> Vec<String> {
+        data[key]["supported_modes"]
+            .as_array()
+            .expect("supported_modes array")
+            .iter()
+            .map(|m| m.as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(
+        modes("gpu"),
+        ["static", "breathing", "strobing", "rainbow", "off"]
+    );
+    let mobo = modes("motherboard");
+    assert_eq!(mobo.len(), 11);
+    for mode in [
+        "wave",
+        "comet",
+        "flash-and-dash",
+        "glowing-yoyo",
+        "starry-night",
+    ] {
+        assert!(mobo.iter().any(|m| m == mode) && !modes("gpu").iter().any(|m| m == mode));
+    }
+}

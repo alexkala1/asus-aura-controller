@@ -141,7 +141,13 @@ pub struct GpuStatus {
     pub color_configurable: bool,
     pub color_hex: String,
     pub rgb: [u8; 3],
+    /// Effects the GP106 registers can run, in the Studio's vocabulary.
+    pub supported_modes: Vec<&'static str>,
 }
+
+/// The GPU has one zone and four hardware effects (registers 0x07 = 1..=4) plus off.
+/// Spectrum is its color cycle, listed as `rainbow`; multi-zone effects do not exist here.
+pub const GPU_SUPPORTED_MODES: [&str; 5] = ["static", "breathing", "strobing", "rainbow", "off"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GpuSnapshot {
@@ -211,6 +217,7 @@ impl<B: I2cBus> GpuController<B> {
             ),
             color_hex: format!("{r:02x}{g:02x}{b:02x}"),
             rgb: [r, g, b],
+            supported_modes: GPU_SUPPORTED_MODES.to_vec(),
         })
     }
 

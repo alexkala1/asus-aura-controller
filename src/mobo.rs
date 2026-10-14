@@ -98,7 +98,23 @@ pub struct MoboStatus {
     pub color_source: String,
     pub color_configurable: bool,
     pub zones: Vec<MoboZone>,
+    /// Effects the ENE firmware runs, in the Studio's vocabulary.
+    pub supported_modes: Vec<&'static str>,
 }
+
+pub const MOBO_SUPPORTED_MODES: [&str; 11] = [
+    "static",
+    "breathing",
+    "strobing",
+    "color-cycle",
+    "rainbow",
+    "comet",
+    "flash-and-dash",
+    "wave",
+    "glowing-yoyo",
+    "starry-night",
+    "off",
+];
 
 /// Both color buffers (direct 0x8000..0x8010, effect 0x8010..0x8020) hold five RGB
 /// triplets; the next register (0x8020) is the direct-mode flag.
@@ -304,6 +320,7 @@ impl<P: PortIo> MoboController<P> {
             .to_owned(),
             color_configurable: direct || decoded_mode.is_some_and(MoboMode::uses_color),
             zones,
+            supported_modes: MOBO_SUPPORTED_MODES.to_vec(),
         })
     }
 

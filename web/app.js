@@ -8,6 +8,10 @@ const modes = [
   ["glowing-yoyo", "Glowing yoyo", "rainbow-pulse"], ["starry-night", "Starry night", "random-flicker"],
   ["off", "Off", "off"],
 ];
+// Effects each detected device reports (`supported_modes` in /api/status); the full list until known.
+const supported = { gpu: modes.map(([key]) => key), mobo: modes.map(([key]) => key) };
+// Sync All can only offer what every linked device runs.
+const allowedModes = channel => (sync.checked ? supported.gpu.filter(key => supported.mobo.includes(key)) : supported[deviceKey(channel)]);
 const gpuModes = new Set(["static", "breathing", "flashing", "spectrum", "off"]);
 // The GPU's only autonomous effect is its Spectrum color cycle: rainbow-style effects run it.
 const gpuSpectrumModes = new Set(["spectrum", "rainbow", "rainbow-breathing", "wave", "rainbow-pulse"]);
@@ -70,7 +74,6 @@ for (const channel of channels) {
     input.closest("label").htmlFor = input.id;
     input.disabled = true;
   }
-  for (const [value, label] of modes) card.querySelector(".mode-picker").add(new Option(label, value));
   channel.card = card;
   const update = (key, value) => {
     if (!connected || busy) return;
@@ -160,7 +163,12 @@ function render() {
     card.dataset.colorSource = autonomous ? "autonomous" : "configured";
     if (shown) card.querySelector(".color-picker").value = shown;
     card.querySelector(".hex-value").textContent = channel.mode === "off" ? "Off" : autonomous ? "Auto" : shown ? shown.toUpperCase() : "—";
-    card.querySelector(".mode-picker").value = channel.mode;
+    const picker = card.querySelector(".mode-picker");
+    const allowed = allowedModes(channel);
+    if (picker.options.length !== allowed.length || allowed.some((key, i) => picker.options[i].value !== key)) {
+      picker.replaceChildren(...allowed.map(key => new Option(modes.find(([value]) => value === key)[1], key)));
+    }
+    picker.value = channel.mode;
     card.querySelector(".speed-slider").value = channel.speed;
     card.querySelector(".speed-value").textContent = channel.id === "gpu" ? "Fixed" : channel.speed;
   }
@@ -225,6 +233,19 @@ function zonePayloads() {
 }
 
 // What Apply sends, in order: the staged device-wide change first, then any staged zones.
+// A request may only name an effect its target hardware (or, linked, both devices) can run.
+const effectAllowed = () => allowedModes(active).includes(active.mode);
+
+function reconcileLinkedState() {
+  if (!sync.checked) return;
+  const common = allowedModes(active);
+  const staged = dirty.gpu || dirty.mobo;
+  const representable = channels.every(channel => common.includes(channel.mode)) && channels[0].mode === channels[1].mode;
+  if (representable || (staged && channels.every(channel => common.includes(channel.mode)))) return;
+  sync.checked = false;
+  notify("Sync All turned off: the devices are running different effects. Each shows its own state.", "default");
+}
+
 function requests() {
   const wide = selection();
   const zones = active.id === "mobo" && !sync.checked ? zonePayloads() : [];
@@ -249,7 +270,9 @@ function commandLine({ target, zone, mode, color, speed, off }) {
 
 function selection() {
   const target = sync.checked ? "all" : active.id === "gpu" ? "gpu" : "mobo";
-  const mapped = nativeMode(active);
+  // Linked: the shared Studio effect decides; a device's readback spelling (GPU `spectrum`)
+  // must not leak into the `all` request, which would run Spectrum Cycle on the board.
+  const mapped = sync.checked ? modes.find(([key]) => key === active.mode)[2] : nativeMode(active);
   const off = active.mode === "off";
   // Mode name sent to the CLI. `all` takes the native name and maps each device itself;
   // a GPU-only command must name a mode the GPU has.
@@ -340,15 +363,17 @@ function hardwareData(data) {
     throw new Error("Hardware identity or LED data could not be verified. Check the daemon and device connections.");
   }
   const aliases = { "rainbow-breathing": "breathing", chase: "comet", "spectrum-chase": "flash-and-dash" };
-  const displayMode = value => {
+  const displayMode = (value, device = "mobo") => {
     const native = typeof value === "string" ? value.replaceAll("_", "-") : "";
+    // The GPU's Spectrum is its color cycle, listed as Rainbow.
+    if (device === "gpu" && native === "spectrum") return "rainbow";
     return modes.find(([, , name]) => name === native)?.[0] || aliases[native];
   };
-  if (!displayMode(gpu.mode) || !displayMode(mobo.mode)) throw new Error("Unsupported hardware effect reported. Refresh after selecting a supported CLI mode.");
+  if (!displayMode(gpu.mode, "gpu") || !displayMode(mobo.mode)) throw new Error("Unsupported hardware effect reported. Refresh after selecting a supported CLI mode.");
   if (!Number.isInteger(mobo.speed) || mobo.speed < 0 || mobo.speed > 4) throw new Error("Hardware effect speed is outside the supported range.");
   // Direct output overrides a stale effect code in the board's mode register.
   const moboMode = mobo.color_source === "direct" ? "static" : displayMode(mobo.mode);
-  return { gpu, mobo, gpuMode: displayMode(gpu.mode), moboMode };
+  return { gpu, mobo, gpuMode: displayMode(gpu.mode, "gpu"), moboMode };
 }
 
 async function refreshStatus() {
@@ -364,6 +389,10 @@ async function refreshStatus() {
     if (result.mode !== "live") throw new Error("Daemon did not return live hardware status.");
     const { gpu, mobo, gpuMode, moboMode } = hardwareData(result.data);
     // Legacy daemons have no metadata: infer whether their RGB buffers are active.
+    for (const [key, status] of [["gpu", gpu], ["mobo", mobo]]) {
+      const known = Array.isArray(status.supported_modes) ? status.supported_modes.filter(name => modes.some(([value]) => value === name)) : [];
+      if (known.length) supported[key] = modes.map(([value]) => value).filter(value => known.includes(value));
+    }
     const hasConfiguredColor = (status, channel) => status.color_configurable ?? configurableColor(channel);
     if (!dirty.gpu) {
       Object.assign(channels[0], { mode: gpuMode, nativeMode: gpu.mode.replaceAll("_", "-") });
@@ -391,6 +420,7 @@ async function refreshStatus() {
     $("#mobo-state").textContent = "Verified";
     $("#firmware").textContent = mobo.firmware;
     setControlState("success");
+    reconcileLinkedState();
   } catch (error) {
     connected = false;
     $(".connection").dataset.state = "error";
@@ -410,6 +440,10 @@ async function refreshStatus() {
 
 apply.addEventListener("click", async () => {
   if (!connected || busy || refreshing) return;
+  if (!effectAllowed()) {
+    notify("This device cannot run the selected effect. Pick a supported effect before applying.", "error");
+    return;
+  }
   const list = requests();
   busy = true;
   setControlState("loading");
@@ -463,7 +497,13 @@ copy.addEventListener("click", async () => {
 });
 sync.addEventListener("change", () => {
   if (sync.checked) {
-    for (const channel of channels) Object.assign(channel, { color: active.color, mode: active.mode, nativeMode: active.nativeMode, speed: active.speed });
+    if (!allowedModes(active).includes(active.mode)) {
+      Object.assign(active, { mode: "static", nativeMode: null });
+      if (!active.color) active.color = "#ffffff";
+    }
+    // The shared effect is the Studio effect on screen; device-specific readback spellings
+    // (GPU `spectrum`, board `rainbow-breathing`) must not leak into the linked request.
+    for (const channel of channels) Object.assign(channel, { color: active.color, mode: active.mode, nativeMode: null, speed: active.speed });
     zoneColors.fill(active.color);
     activeZone = null;
     zoneDirty.clear();

@@ -299,7 +299,7 @@ def test_handler_exceptions_release_the_slot_exactly_once(start, server_module, 
 
 def test_autonomous_modes_apply_without_a_color_but_static_still_needs_one(start, server_module):
     port = start()
-    for mode in ("rainbow", "wave", "spectrum"):
+    for mode in ("rainbow", "strobing", "spectrum"):
         body = json.dumps({"target": "all", "mode": mode, "speed": 0, "off": False}).encode()
         response = exchange(port, post(f"Content-Length: {len(body)}\r\n", body))
         assert status_of(response) == 200, (mode, response)
@@ -403,3 +403,65 @@ def test_unsupported_methods_get_a_json_405_with_allow(start, server_module, met
     assert b"Allow: GET, HEAD, POST, OPTIONS" in response
     assert json.loads(response.split(b"\r\n\r\n", 1)[1])["ok"] is False
     assert server_module.calls == []
+
+
+def apply_status(port, **req):
+    body = json.dumps(req).encode()
+    return status_of(exchange(port, post(f"Content-Length: {len(body)}\r\n", body)))
+
+
+def test_apply_rejects_effects_the_target_hardware_cannot_run(start, server_module):
+    port = start()
+    for req in ({"target": "gpu", "mode": "wave"}, {"target": "gpu", "mode": "comet"},
+                {"target": "gpu", "mode": "starry-night"}, {"target": "gpu", "mode": "glowing-yoyo"},
+                {"target": "all", "mode": "wave"}, {"target": "mobo", "mode": "nonsense"}):
+        assert apply_status(port, **req) == 400, req
+    assert server_module.calls == []
+    for req in ({"target": "gpu", "mode": "strobing", "color": "ff0000"}, {"target": "gpu", "mode": "spectrum"},
+                {"target": "mobo", "mode": "wave"}, {"target": "mobo", "mode": "chase-fade", "color": "00ff00"},
+                {"target": "all", "mode": "rainbow"}, {"target": "gpu", "off": True, "mode": "wave"}):
+        assert apply_status(port, **req) == 200, req
+
+
+def test_status_reports_supported_modes_for_legacy_binaries(start, server_module, monkeypatch):
+    legacy = json.dumps({"gpu": {"mode": "static"}, "motherboard": {"mode": "static"}})
+    monkeypatch.setattr(server_module.subprocess, "run", lambda cmd, **kw: SimpleNamespace(returncode=0, stdout=legacy, stderr=""))
+    port = start()
+    body = exchange(port, b"GET /api/status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").split(b"\r\n\r\n", 1)[1]
+    data = json.loads(body)["data"]
+    assert data["gpu"]["supported_modes"] == ["static", "breathing", "strobing", "rainbow", "off"]
+    assert len(data["motherboard"]["supported_modes"]) == 11 and "wave" not in data["gpu"]["supported_modes"]
+
+
+CLI = Path(__file__).resolve().parents[1] / "target" / "debug" / "luminactl"
+
+
+@pytest.mark.skipif(not CLI.exists(), reason="needs `cargo build`")
+def test_validated_requests_are_accepted_by_the_real_cli_in_dry_run(start, server_module, monkeypatch):
+    """The daemon must not pass a spelling its validator allows but the CLI rejects (and vice versa)."""
+    import subprocess
+
+    real_run = subprocess.run
+    results = []
+
+    def run_cli(cmd, **kwargs):
+        done = real_run([str(CLI), "--dry-run", *cmd[3:]], capture_output=True, text=True, timeout=10)
+        results.append(done.returncode)
+        return done
+
+    monkeypatch.setattr(server_module.subprocess, "run", run_cli)
+    port = start()
+    accepted = [("gpu", m) for m in ("static", "breathing", "flashing", "strobing", "spectrum", "color-cycle", "rainbow")]
+    accepted += [("mobo", m) for m in ("static", "breathing", "flashing", "strobing", "spectrum", "color-cycle", "rainbow",
+                                        "rainbow-breathing", "chase", "chase-fade", "spectrum-chase", "spectrum-chase-fade",
+                                        "comet", "flash-and-dash", "wave", "rainbow-pulse", "glowing-yoyo",
+                                        "random-flicker", "starry-night", "flicker")]
+    accepted += [("all", m) for m in ("static", "breathing", "flashing", "strobing", "spectrum", "color-cycle", "rainbow")]
+    for target, mode in accepted:
+        assert apply_status(port, target=target, mode=mode, color="ff0055") == 200, (target, mode)
+    assert results and set(results) == {0}
+    before = len(results)
+    for req in ({"target": "gpu", "mode": "rainbow-breathing"}, {"target": "gpu", "mode": "wave"},
+                {"target": "all", "mode": "rainbow-breathing"}, {"target": "all", "mode": "wave"}):
+        assert apply_status(port, color="ff0055", **req) == 400, req
+    assert len(results) == before  # rejected before any subprocess ran

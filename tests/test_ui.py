@@ -15,8 +15,10 @@ from playwright.sync_api import expect
 WEB = Path(__file__).resolve().parents[1] / "web"
 URL = "http://127.0.0.1:7890"
 STATUS = {
-    "gpu": {"device": "ASUS ROG Strix GeForce GTX 1060 6GB", "bus": "/dev/i2c-0", "address": "0x29", "magic_verified": True, "mode": "static", "color_hex": "ff0055", "rgb": [255, 0, 85]},
-    "motherboard": {"device": "ASUS ROG STRIX Z270E GAMING Motherboard", "super_io": "Nuvoton NCT6793D", "smbus_port": "0x02c0", "slave_address": "0x4e", "firmware": "LED-0116", "led_count": 5, "mode": "static", "speed": 0, "direction": "forward", "zones": [
+    "gpu": {"device": "ASUS ROG Strix GeForce GTX 1060 6GB", "bus": "/dev/i2c-0", "address": "0x29", "magic_verified": True, "mode": "static", "color_hex": "ff0055", "rgb": [255, 0, 85],
+            "supported_modes": ["static", "breathing", "strobing", "rainbow", "off"]},
+    "motherboard": {"device": "ASUS ROG STRIX Z270E GAMING Motherboard", "super_io": "Nuvoton NCT6793D", "smbus_port": "0x02c0", "slave_address": "0x4e", "firmware": "LED-0116", "led_count": 5, "mode": "static", "speed": 0, "direction": "forward",
+        "supported_modes": ["static", "breathing", "strobing", "color-cycle", "rainbow", "comet", "flash-and-dash", "wave", "glowing-yoyo", "starry-night", "off"], "zones": [
         {"led_index": i, "channel": "0x85" if i < 4 else "0x86", "channel_name": "Back I/O" if i < 4 else "RGB Header 1", "hex": "00e5ff", "rgb": [0, 229, 255]} for i in range(5)
     ]},
 }
@@ -152,7 +154,7 @@ def test_live_dashboard(page, daemon, width):
     assert daemon["writes"] == [{"target": "all", "mode": "rainbow", "speed": 4, "off": False}]
     assert daemon["data"]["gpu"]["mode"] == "spectrum"
     assert daemon["data"]["motherboard"]["mode"] == "rainbow"
-    expect(page.locator("#gpu-mode")).to_have_value("color-cycle")  # read back from hardware
+    expect(page.locator("#gpu-mode")).to_have_value("rainbow")  # read back from hardware
 
     page.locator("#gpu-mode").select_option("off")
     expect(page.locator("#command-preview")).to_have_text("sudo luminactl all --off")
@@ -160,10 +162,9 @@ def test_live_dashboard(page, daemon, width):
     expect(page.locator(".channel-card[data-mode=off]")).to_have_count(2)
     expect(page.locator(".board-map")).to_have_attribute("data-mode", "off")
     page.locator("#sync-all").uncheck()
-    page.locator("#gpu-mode").select_option("wave")
-    expect(page.locator("#command-note")).to_contain_text("GPU runs its Spectrum color cycle for wave")
-    page.locator("#gpu-mode").select_option("starry-night")  # no GPU equivalent at all
-    expect(page.locator("#command-note")).to_contain_text("GPU uses static color")
+    expect(page.locator("#gpu-mode option[value=wave], #gpu-mode option[value=starry-night]")).to_have_count(0)
+    page.locator("#mobo-mode").select_option("wave")
+    expect(page.locator("#command-preview")).to_have_text("sudo luminactl mobo --mode wave --speed 0")
 
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
     # overflow-x:clip is a floor, not a way to conceal oversized controls.
@@ -323,9 +324,7 @@ def test_linked_edits_stage_both_devices_and_apply_clears_both(page, daemon):
 
 
 @pytest.mark.parametrize("mode, gpu_note", [
-    ("rainbow", "Spectrum color cycle"), ("wave", "Spectrum color cycle"),
-    ("glowing-yoyo", "Spectrum color cycle"), ("color-cycle", "Spectrum color cycle"),
-    ("starry-night", "Applies to both devices."),
+    ("rainbow", "Spectrum color cycle"),
 ])
 def test_autonomous_modes_omit_color_and_map_gpu_spectrum(page, daemon, mode, gpu_note):
     page.goto(URL, wait_until="networkidle")
@@ -379,7 +378,7 @@ def test_autonomous_status_ignores_black_buffers_and_needs_no_picker_color(page,
     page.locator("#btn-apply").click()
     expect(page.locator("#status-toast")).to_have_text("✓ Applied to hardware.")
     assert "color" not in daemon["writes"][-1]
-    assert daemon["writes"][-1]["mode"] == "spectrum"
+    assert daemon["writes"][-1]["mode"] == "rainbow"
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
     assert daemon["page_errors"] == []
     assert daemon["console_errors"] == []
@@ -394,7 +393,7 @@ def test_autonomous_refresh_preserves_last_configured_color_for_later_static(pag
     gpu = daemon["data"]["gpu"]
     gpu.update(mode="spectrum", color_hex="000000", color_source="autonomous", color_configurable=False)
     page.locator("#btn-refresh").click()
-    expect(page.locator("#gpu-mode")).to_have_value("color-cycle")
+    expect(page.locator("#gpu-mode")).to_have_value("rainbow")
     expect(page.locator("#gpu-color")).to_have_value("#ff0055")
     expect(page.locator("#gpu .hex-value")).to_have_text("Auto")
     page.locator("#gpu-mode").select_option("static")
@@ -727,3 +726,91 @@ def test_unreachable_daemon_gets_a_friendly_banner(page, daemon):
     page.route(f"{URL}/**", handle)
     page.goto(URL, wait_until="networkidle")
     expect(page.locator("#connection-help")).to_contain_text("Cannot reach the daemon")
+
+
+def picker_values(page, selector):
+    return page.locator(f"{selector} option").evaluate_all("els => els.map(el => el.value)")
+
+
+def test_mode_pickers_list_only_what_each_device_supports(page, daemon):
+    page.goto(URL, wait_until="networkidle")
+    assert picker_values(page, "#gpu-mode") == ["static", "breathing", "strobing", "rainbow", "off"]
+    assert picker_values(page, "#mobo-mode") == ["static", "breathing", "strobing", "color-cycle", "rainbow", "comet",
+                                                  "flash-and-dash", "wave", "glowing-yoyo", "starry-night", "off"]
+    for impossible in ("wave", "comet", "flash-and-dash", "glowing-yoyo", "starry-night"):
+        assert impossible not in picker_values(page, "#gpu-mode")
+
+
+def test_sync_all_offers_only_the_common_effects_and_falls_back_from_unsupported_ones(page, daemon):
+    page.goto(URL, wait_until="networkidle")
+    page.locator("#mobo-mode").select_option("wave")
+    page.locator("#mobo-mode").focus()
+    page.locator("#sync-all").check()
+    common = ["static", "breathing", "strobing", "rainbow", "off"]
+    assert picker_values(page, "#gpu-mode") == common
+    assert picker_values(page, "#mobo-mode") == common
+    expect(page.locator("#mobo-mode")).to_have_value("static")
+    page.locator("#sync-all").uncheck()
+    assert len(picker_values(page, "#mobo-mode")) == 11
+    assert picker_values(page, "#gpu-mode") == common
+
+
+def test_gpu_running_spectrum_is_listed_as_rainbow(page, daemon):
+    daemon["data"]["gpu"]["mode"] = "spectrum"
+    page.goto(URL, wait_until="networkidle")
+    expect(page.locator("#gpu-mode")).to_have_value("rainbow")
+
+
+def test_sync_all_from_gpu_spectrum_readback_sends_rainbow_not_spectrum(page, daemon):
+    daemon["data"]["gpu"]["mode"] = "spectrum"
+    page.goto(URL, wait_until="networkidle")
+    page.locator("#sync-all").check()
+    expect(page.locator("#command-preview")).to_have_text("sudo luminactl all --mode rainbow")
+    page.locator("#btn-apply").click()
+    expect(page.locator("#status-toast")).to_have_text("✓ Applied to hardware.")
+    # The automatic refresh re-reads GPU `spectrum`; it must not change the linked request.
+    expect(page.locator("#btn-refresh")).to_have_text("Refresh devices")
+    expect(page.locator("#sync-all")).to_be_checked()
+    expect(page.locator("#command-preview")).to_have_text("sudo luminactl all --mode rainbow")
+    page.locator("#btn-apply").click()
+    expect(page.locator("#status-toast")).to_have_text("✓ Applied to hardware.")
+    expect(page.locator("#btn-refresh")).to_have_text("Refresh devices")
+    assert daemon["writes"] == [{"target": "all", "mode": "rainbow", "speed": 0, "off": False}] * 2
+    assert daemon["data"]["gpu"]["mode"] == "spectrum" and daemon["data"]["motherboard"]["mode"] == "rainbow"
+    expect(page.locator("#sync-all")).to_be_checked()
+    expect(page.locator("#mobo-mode")).to_have_value("rainbow")
+
+
+def test_sync_all_from_rainbow_breathing_readback_sends_breathing(page, daemon):
+    daemon["data"]["motherboard"].update(mode="rainbow_breathing", color_source="effect", color_configurable=False)
+    page.goto(URL, wait_until="networkidle")
+    expect(page.locator("#mobo-mode")).to_have_value("breathing")
+    page.locator("#mobo-mode").focus()
+    page.locator("#sync-all").check()
+    expect(page.locator("#command-preview")).to_contain_text("--mode breathing")
+    expect(page.locator("#command-preview")).not_to_contain_text("rainbow-breathing")
+
+
+def test_refresh_after_linked_apply_unlinks_when_a_device_changes_to_an_unlinkable_effect(page, daemon):
+    page.goto(URL, wait_until="networkidle")
+    page.locator("#sync-all").check()
+    page.locator("#btn-apply").click()
+    expect(page.locator("#status-toast")).to_have_text("✓ Applied to hardware.")
+    daemon["writes"].clear()
+    daemon["data"]["motherboard"].update(mode="wave", color_source="autonomous", color_configurable=False)
+    page.locator("#btn-refresh").click()
+    expect(page.locator("#sync-all")).not_to_be_checked()
+    expect(page.locator("#mobo-mode")).to_have_value("wave")
+    assert "wave" in picker_values(page, "#mobo-mode") and "wave" not in picker_values(page, "#gpu-mode")
+    page.locator("#mobo-mode").focus()
+    assert "all" not in page.locator("#command-preview").inner_text().split()
+    assert daemon["writes"] == []
+
+
+def test_apply_never_sends_an_effect_outside_the_intersection(page, daemon):
+    page.goto(URL, wait_until="networkidle")
+    page.locator("#sync-all").check()
+    page.evaluate("() => { channels[1].mode = 'wave'; active = channels[1]; }")
+    page.locator("#btn-apply").click()
+    expect(page.locator("#status-toast")).to_contain_text("cannot run the selected effect")
+    assert daemon["writes"] == []
