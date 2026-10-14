@@ -176,10 +176,23 @@ fn plan_effect(
         }
         plan.gpu = Some(GpuOp {
             mode: gpu_mode.unwrap_or(GpuMode::Static),
-            color,
+            color: color.filter(|_| gpu_mode != Some(GpuMode::Spectrum)),
         });
+        if color.is_some() && gpu_mode == Some(GpuMode::Spectrum) {
+            plan.notes.push(
+                "GPU spectrum generates its own colors; supplied color is ignored.".to_owned(),
+            );
+        }
     }
     if target.mobo() {
+        let color = if matches!(mobo_mode, MoboMode::Spectrum | MoboMode::Rainbow) {
+            if color.is_some() {
+                plan.notes.push("Motherboard rainbow/spectrum generates its own colors; supplied color is ignored.".to_owned());
+            }
+            None
+        } else {
+            color
+        };
         plan.mobo = Some(match (mobo_mode, color) {
             (MoboMode::Static, Some(color)) => MoboOp::Static(color),
             (MoboMode::Static, None) => MoboOp::Mode(MoboMode::Static),
@@ -565,22 +578,42 @@ impl Server {
             Ok(value) => value,
             Err(e) => return Some(rpc_error(&Value::Null, -32700, format!("Parse error: {e}"))),
         };
+        match message {
+            // Batches (required by protocol 2025-03-26, optional later): answer with an
+            // array of the non-notification replies, or nothing if all were notifications.
+            Value::Array(items) if items.is_empty() => Some(rpc_error(
+                &Value::Null,
+                -32600,
+                "Invalid request: empty batch",
+            )),
+            Value::Array(items) => {
+                let replies: Vec<Value> = items
+                    .into_iter()
+                    .filter_map(|item| self.handle_message(item))
+                    .collect();
+                (!replies.is_empty()).then_some(Value::Array(replies))
+            }
+            other => self.handle_message(other),
+        }
+    }
+
+    /// One JSON-RPC message (never a batch) to at most one reply.
+    fn handle_message(&mut self, message: Value) -> Option<Value> {
         let Some(object) = message.as_object() else {
             return Some(rpc_error(
                 &Value::Null,
                 -32600,
-                "Expected a single JSON-RPC request object (batches are not supported)",
+                "Invalid request: expected a JSON-RPC request object",
             ));
         };
         let id = object.get("id");
-        if !matches!(
-            id,
-            None | Some(Value::Null | Value::String(_) | Value::Number(_))
-        ) {
+        // MCP forbids null ids, and a null id would be indistinguishable from the id of
+        // a parse-error reply. A request with no `id` member at all is a notification.
+        if !matches!(id, None | Some(Value::String(_) | Value::Number(_))) {
             return Some(rpc_error(
                 &Value::Null,
                 -32600,
-                "`id` must be a string, number or null",
+                "`id` must be a string or a number",
             ));
         }
         let reply_id = id.cloned().unwrap_or(Value::Null);
@@ -1236,7 +1269,8 @@ fn shutdown_cleanup(server: &mut Server) {
 
 pub fn serve(dry_run: bool) -> Result<(), String> {
     // Linux signal handlers only set a lock-free flag; restoration stays on this thread.
-    for signum in [2, 15] {
+    // HUP (closed terminal/SSH), INT, QUIT and TERM all take the same restore-and-exit path.
+    for signum in [1, 2, 3, 15] {
         if unsafe { signal(signum, request_shutdown) } == usize::MAX {
             return Err(format!(
                 "cannot install signal handler: {}",
@@ -1302,7 +1336,7 @@ mod tests {
             plan.gpu,
             Some(GpuOp {
                 mode: GpuMode::Spectrum,
-                color: Some((1, 2, 3))
+                color: None
             })
         );
         assert_eq!(
@@ -1310,10 +1344,10 @@ mod tests {
             Some(MoboOp::Effect {
                 mode: MoboMode::Spectrum,
                 speed: 2,
-                color: Some((1, 2, 3))
+                color: None
             })
         );
-        assert_eq!(plan.notes.len(), 1); // speed ignored on GPU
+        assert_eq!(plan.notes.len(), 3); // GPU speed and both autonomous colors ignored.
 
         // Effects without any GPU equivalent fall back to static color...
         let flicker = plan_effect(Target::All, "starry-night", None, None).unwrap();

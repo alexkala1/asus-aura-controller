@@ -127,3 +127,43 @@ Using REA (`inspect_managed_artifact`, `open_binary`, `binary_session`):
 3. **Reference Controller Verification**:
    The standalone tool [lumina_ctl.py](lumina_ctl.py) implements both the GPU and Motherboard protocols, with safety signature verification and comprehensive unit tests.
 
+---
+
+## 4. Hardware Effects & Register Analysis from Upstream Binaries
+
+Static disassembly of the supplied packages establishes the GPU dispatch below.
+The exact LED-0116 motherboard sequence is not established by these artifacts;
+see [RAINBOW_FIX_REPORT.md](RAINBOW_FIX_REPORT.md) for evidence and live results.
+
+### A. Motherboard ENE-0116 Effects Protocol
+* **Current Linux driver sequence (not a recovered vendor sequence)**:
+  - `0x8020 = 0` (leave direct operation), then `0x8021 = 5` for Rainbow or `4`
+    for Spectrum, `0x8022 = speed`, `0x8023 = direction`, and `0x80A0 = 1`.
+  - Live Rainbow commands returned success and read back mode 5 with direct
+    operation disabled. This does not establish vendor-required write ordering
+    or visually confirm the emitted animation.
+  - The supplied `HAL_DLL_X64` identifies itself as ENE external-drive RGB for
+    ASMedia and uses `0x802f` for its apply operation. It is not proof of the
+    LED-0116 motherboard protocol; do not transplant that sequence.
+* **Status Readback Quirk (`#000000` in Effect Mode)**:
+  - Live readback reports mode Rainbow and zero configured effect-buffer bytes.
+    Those bytes alone do not prove darkness or a failed animation. Status/UI
+    distinguish configured RGB from autonomous modes instead of presenting
+    inactive buffer bytes as sampled live LED colors. Internal frame-generation
+    details remain unverified for the supplied motherboard artifacts.
+
+### B. GPU GP106 Register Dynamics
+* **Modes Supported**:
+  - `0x00`: Off (the Linux driver's mode table; firmware implementation unverified)
+  - `0x01`: Static
+  - `0x02`: Breathing
+  - `0x03`: Flashing / Strobing
+  - `0x04`: Spectrum Cycle
+* **Lack of Multi-Zone Rainbow**:
+  - The GTX 1060 GP106 RGB controller controls a single physical lighting zone. It has no multi-zone addressable rainbow wave.
+  - The ordinary mode branch in adjacent `VGA_Extra_x64.dll` at
+    `0x180004d7b–0x180004d9b` writes `0x07 = mode`.
+  - `0x0C` belongs to a separate `fnSetLEDFrame` request; `0x0E` belongs to
+    `fnSetLEDBurn`. `fnApplySetting` returns true without a register write.
+    Neither separate operation is established as a routine mode prerequisite;
+    luminactl no longer writes `0x0E = 1` on normal mode/color updates.

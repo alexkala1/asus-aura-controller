@@ -344,3 +344,36 @@ def test_overload_response_disables_caching(start):
         assert b"Cache-Control: no-cache, no-store, must-revalidate\r\n" in response
     finally:
         held.close()
+
+
+def test_routes_ignore_query_strings_and_head_is_a_cheap_probe(start, server_module, monkeypatch):
+    def fake_status(cmd, **kwargs):
+        server_module.calls.append(cmd)
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"gpu": {}, "motherboard": {}}), stderr="")
+
+    monkeypatch.setattr(server_module.subprocess, "run", fake_status)
+    port = start()
+    for target in ("/api/status", "/api/status?x=1", "/api/status?x=1#frag"):
+        response = exchange(port, f"GET {target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".encode())
+        assert status_of(response) == 200, (target, response)
+    assert len(server_module.calls) == 3
+    head = exchange(port, b"HEAD /api/status?x=1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    assert status_of(head) == 200
+    assert head.endswith(b"\r\n\r\n"), "HEAD must not carry a body"
+    assert b"application/json" in head
+    assert len(server_module.calls) == 3, "HEAD must not run the CLI"
+    body = json.dumps({"target": "gpu", "mode": "static", "color": "ff0055"}).encode()
+    response = exchange(port, post(f"Content-Length: {len(body)}\r\n", body).replace(b"/api/apply", b"/api/apply?x=1"))
+    assert status_of(response) == 200
+    assert len(server_module.calls) == 4
+    assert status_of(exchange(port, b"HEAD /nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")) == 404
+
+
+@pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE"])
+def test_unsupported_methods_get_a_json_405_with_allow(start, server_module, method):
+    port = start()
+    response = exchange(port, f"{method} /api/apply HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".encode())
+    assert status_of(response) == 405
+    assert b"Allow: GET, HEAD, POST, OPTIONS" in response
+    assert json.loads(response.split(b"\r\n\r\n", 1)[1])["ok"] is False
+    assert server_module.calls == []

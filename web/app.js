@@ -200,10 +200,33 @@ function notify(message, state) {
   $("#status-toast").dataset.state = state;
 }
 
+const httpMessages = {
+  404: "The daemon does not know that request. Restart python3 web/serve.py after updating.",
+  405: "The daemon does not support that request.",
+  408: "The daemon timed out reading the request. Try again.",
+  413: "The request was too large for the daemon.",
+  421: "The daemon refused the request host. Open http://127.0.0.1:7890 directly.",
+  501: "The daemon does not support that request.",
+  503: "The daemon is busy or the hardware is unavailable. Retry in a moment.",
+};
+
+// Turns anything the daemon (or a proxy in front of it) can answer into one readable
+// message: never a raw JSON parser error.
 async function api(path, options = {}) {
-  const response = await fetch(path, { ...options, cache: "no-store", signal: AbortSignal.timeout(12000) });
-  const data = await response.json();
-  if (!response.ok || !data.ok) throw new Error(data.error || `Daemon request failed (${response.status}).`);
+  let response;
+  try {
+    response = await fetch(path, { ...options, cache: "no-store", signal: AbortSignal.timeout(12000) });
+  } catch (error) {
+    if (error?.name === "TimeoutError" || error?.name === "AbortError") throw new Error("The daemon did not answer in time. Check that it is still running.");
+    throw new Error("Cannot reach the daemon. Start it with python3 web/serve.py.");
+  }
+  let data = null;
+  if ((response.headers.get("content-type") || "").includes("application/json")) {
+    try { data = await response.json(); } catch { data = null; }
+  }
+  if (!response.ok || !data?.ok) {
+    throw new Error(data?.error || httpMessages[response.status] || `Daemon request failed (${response.status}).`);
+  }
   return data;
 }
 
@@ -225,7 +248,9 @@ function hardwareData(data) {
   };
   if (!displayMode(gpu.mode) || !displayMode(mobo.mode)) throw new Error("Unsupported hardware effect reported. Refresh after selecting a supported CLI mode.");
   if (!Number.isInteger(mobo.speed) || mobo.speed < 0 || mobo.speed > 4) throw new Error("Hardware effect speed is outside the supported range.");
-  return { gpu, mobo, gpuMode: displayMode(gpu.mode), moboMode: displayMode(mobo.mode) };
+  // Direct output overrides a stale effect code in the board's mode register.
+  const moboMode = mobo.color_source === "direct" ? "static" : displayMode(mobo.mode);
+  return { gpu, mobo, gpuMode: displayMode(gpu.mode), moboMode };
 }
 
 async function refreshStatus() {
@@ -247,7 +272,7 @@ async function refreshStatus() {
       if (gpu.color_source !== "autonomous" && hasConfiguredColor(gpu, channels[0])) channels[0].color = `#${gpu.color_hex}`;
     }
     if (!dirty.mobo) {
-      Object.assign(channels[1], { mode: moboMode, nativeMode: mobo.mode.replaceAll("_", "-"), speed: mobo.speed });
+      Object.assign(channels[1], { mode: moboMode, nativeMode: mobo.color_source === "direct" ? "static" : mobo.mode.replaceAll("_", "-"), speed: mobo.speed });
       if (mobo.color_source !== "autonomous" && hasConfiguredColor(mobo, channels[1])) {
         zoneColors = mobo.zones.map(zone => `#${zone.hex}`);
         channels[1].color = zoneColors[0];

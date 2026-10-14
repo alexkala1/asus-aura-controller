@@ -96,6 +96,55 @@ MOBO_MODES = {
 }
 MOBO_MODE_NAMES = {v: k for k, v in MOBO_MODES.items()}
 
+# One vocabulary for every subcommand, matching the Rust CLI: friendly aliases map onto
+# the native names, and `all` resolves one name to a (GPU mode, motherboard mode) pair.
+GPU_ALIASES = {"rainbow": "spectrum", "color-cycle": "spectrum", "strobing": "flashing"}
+MOBO_ALIASES = {
+    "color-cycle": "spectrum", "strobing": "flashing", "comet": "chase_fade",
+    "flash-and-dash": "spectrum_chase_fade", "glowing-yoyo": "rainbow_pulse",
+    "starry-night": "random_flicker",
+}
+# Rainbow-style effects run the GPU's only autonomous effect: its Spectrum color cycle.
+GPU_SPECTRUM_FOR = {"rainbow", "rainbow_breathing", "wave", "rainbow_pulse"}
+# Motherboard effects that draw from a configured color (REA mode table).
+MOBO_COLOR_MODES = {"static", "breathing", "flashing", "chase_fade", "chase"}
+
+
+def resolve_gpu_mode(name: str) -> str:
+    key = name.strip().lower().replace("_", "-")
+    native = GPU_ALIASES.get(key, key.replace("-", "_"))
+    if native not in GPU_MODES:
+        raise ValueError(f"invalid GPU mode '{name}' (choose from {', '.join(sorted(GPU_MODES))}, rainbow, color-cycle)")
+    return native
+
+
+def resolve_mobo_mode(name: str) -> str:
+    key = name.strip().lower().replace("_", "-")
+    native = MOBO_ALIASES.get(key, key.replace("-", "_"))
+    if native not in MOBO_MODES:
+        raise ValueError(f"invalid motherboard mode '{name}'")
+    return native
+
+
+def resolve_all_mode(name: str) -> Tuple[str, str]:
+    """(GPU mode name, motherboard mode name) for `all --mode`; unknown names are errors."""
+    try:
+        mobo = resolve_mobo_mode(name)
+    except ValueError:
+        mobo = None
+    try:
+        gpu = resolve_gpu_mode(name)
+    except ValueError:
+        gpu = None
+    if mobo is None and gpu is None:
+        raise ValueError(f"invalid mode '{name}'")
+    mobo = mobo or "static"
+    if mobo in GPU_SPECTRUM_FOR:
+        gpu = "spectrum"
+    elif gpu is None:
+        gpu = "static"  # no GPU equivalent: fall back to static color
+    return gpu, mobo
+
 MOBO_CHANNELS = {
     0x84: "Audio",
     0x85: "Back I/O",
@@ -378,15 +427,18 @@ class MoboAuraController:
             mode_val = self.ene_read_reg(MOBO_REG_MODE) if not self.dry_run else 5
             speed_val = self.ene_read_reg(MOBO_REG_SPEED) if not self.dry_run else 0
             dir_val = self.ene_read_reg(MOBO_REG_DIRECTION) if not self.dry_run else 0
+            direct = (self.ene_read_reg(MOBO_REG_DIRECT) != 0) if not self.dry_run else False
+            # Report the configured color of the buffer the board is actually using.
+            color_base = MOBO_REG_COLORS_DIRECT if direct else MOBO_REG_COLORS_EFFECT
 
             # Read channels
             zones = []
             for i in range(led_count):
                 ch = self.ene_read_reg(MOBO_REG_CONFIG + 0x13 + i) if not self.dry_run else (0x85 if i < 4 else 0x86)
                 ch_name = MOBO_CHANNELS.get(ch, f"Unknown(0x{ch:02x})")
-                r = self.ene_read_reg(MOBO_REG_COLORS_DIRECT + (i * 3)) if not self.dry_run else 0
-                b = self.ene_read_reg(MOBO_REG_COLORS_DIRECT + (i * 3) + 1) if not self.dry_run else 0
-                g = self.ene_read_reg(MOBO_REG_COLORS_DIRECT + (i * 3) + 2) if not self.dry_run else 0
+                r = self.ene_read_reg(color_base + (i * 3)) if not self.dry_run else 0
+                b = self.ene_read_reg(color_base + (i * 3) + 1) if not self.dry_run else 0
+                g = self.ene_read_reg(color_base + (i * 3) + 2) if not self.dry_run else 0
                 zones.append({
                     "led_index": i,
                     "channel": f"0x{ch:02x}",
@@ -405,6 +457,7 @@ class MoboAuraController:
                 "mode": MOBO_MODE_NAMES.get(mode_val, f"unknown({mode_val})"),
                 "speed": speed_val,
                 "direction": "forward" if dir_val == 0 else "reverse",
+                "color_source": "direct" if direct else "effect",
                 "zones": zones
             }
         finally:
@@ -432,15 +485,50 @@ class MoboAuraController:
             self.close()
 
     def set_mode(self, mode: int, speed: int = 0, direction: int = 0):
+        """Mode-only transition. Anything but static leaves direct mode first: a set direct
+        flag keeps the board on the static direct buffer. Static keeps the current buffer."""
         self.open()
         try:
             self.verify()
-            self.ene_write_reg(MOBO_REG_MODE, mode)
-            self.ene_write_reg(MOBO_REG_SPEED, speed)
-            self.ene_write_reg(MOBO_REG_DIRECTION, direction)
-            self.ene_write_reg(MOBO_REG_APPLY, 0x01)
+            if mode != MOBO_MODES["static"]:
+                self.ene_write_reg(MOBO_REG_DIRECT, 0x00)
+            self._write_mode(mode, speed, direction)
         finally:
             self.close()
+
+    def set_effect(self, mode: int, speed: int = 0, color: Optional[Tuple[int, int, int]] = None,
+                   direction: int = 0):
+        """Animated effect; `color` fills the effect color buffer (red, blue, green order)."""
+        self.open()
+        try:
+            self.verify()
+            self.ene_write_reg(MOBO_REG_DIRECT, 0x00)
+            if color is not None:
+                red, green, blue = color
+                for i in range(5):
+                    self.ene_write_reg(MOBO_REG_COLORS_EFFECT + (i * 3) + 0, red)
+                    self.ene_write_reg(MOBO_REG_COLORS_EFFECT + (i * 3) + 1, blue)
+                    self.ene_write_reg(MOBO_REG_COLORS_EFFECT + (i * 3) + 2, green)
+            self._write_mode(mode, speed, direction)
+        finally:
+            self.close()
+
+    def _write_mode(self, mode: int, speed: int, direction: int):
+        self.ene_write_reg(MOBO_REG_MODE, mode)
+        self.ene_write_reg(MOBO_REG_SPEED, speed)
+        self.ene_write_reg(MOBO_REG_DIRECTION, direction)
+        self.ene_write_reg(MOBO_REG_APPLY, 0x01)
+
+
+def _mode_arg(resolver):
+    """argparse `type=` wrapper turning a resolver's ValueError into a usage error."""
+    def parse(value):
+        try:
+            resolver(value)
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(str(e))
+        return value
+    return parse
 
 
 def main():
@@ -457,20 +545,20 @@ def main():
     # Subcommand: gpu
     p_gpu = subparsers.add_parser("gpu", help="Control GPU LEDs")
     p_gpu.add_argument("--color", type=str, help="Hex color code (e.g. ff0055 or 00ffcc)")
-    p_gpu.add_argument("--mode", type=str, choices=list(GPU_MODES.keys()), default="static", help="Lighting mode")
+    p_gpu.add_argument("--mode", type=_mode_arg(resolve_gpu_mode), default="static", help="Lighting mode (off, static, breathing, flashing, spectrum; rainbow and color-cycle mean spectrum)")
     p_gpu.add_argument("--off", action="store_true", help="Turn GPU LEDs off")
 
     # Subcommand: mobo
     p_mobo = subparsers.add_parser("mobo", help="Control Motherboard LEDs")
     p_mobo.add_argument("--color", type=str, help="Hex color code (e.g. ff0055 or 00ffcc)")
-    p_mobo.add_argument("--mode", type=str, choices=list(MOBO_MODES.keys()), default="static", help="Lighting mode")
+    p_mobo.add_argument("--mode", type=_mode_arg(resolve_mobo_mode), default="static", help="Lighting mode (native names or aliases such as comet, starry-night)")
     p_mobo.add_argument("--speed", type=int, choices=[0, 1, 2, 3, 4], default=0, help="Effect speed (0=fastest, 4=slowest)")
     p_mobo.add_argument("--off", action="store_true", help="Turn Motherboard LEDs off")
 
     # Subcommand: all
     p_all = subparsers.add_parser("all", help="Control both GPU and Motherboard LEDs synchronously")
-    p_all.add_argument("--color", type=str, required=True, help="Hex color code (e.g. ff0055 or 00ffcc)")
-    p_all.add_argument("--mode", type=str, default="static", help="Lighting mode (static, breathing, etc.)")
+    p_all.add_argument("--color", type=str, help="Hex color code; required for static mode, optional for effects")
+    p_all.add_argument("--mode", type=_mode_arg(resolve_all_mode), default="static", help="Lighting mode (static, breathing, rainbow, wave, ...)")
     p_all.add_argument("--off", action="store_true", help="Turn all LEDs off")
 
     args = parser.parse_args()
@@ -503,28 +591,39 @@ def main():
         if args.off:
             gpu.set_mode(GPU_MODES["off"])
             print("[GPU] LEDs turned off.")
-        elif args.color:
-            r, g, b = parse_hex_color(args.color)
-            mode_code = GPU_MODES[args.mode]
-            gpu.set_color(r, g, b, mode=mode_code)
-            print(f"[GPU] Color set to #{args.color.lstrip('#')} (Mode: {args.mode}).")
         else:
-            mode_code = GPU_MODES[args.mode]
-            gpu.set_mode(mode_code)
-            print(f"[GPU] Mode set to {args.mode}.")
+            mode_name = resolve_gpu_mode(args.mode)
+            mode_code = GPU_MODES[mode_name]
+            if args.color:
+                r, g, b = parse_hex_color(args.color)
+                gpu.set_color(r, g, b, mode=mode_code)
+                if mode_name == "spectrum":
+                    print("[GPU] Spectrum generates its own colors; --color ignored.")
+                else:
+                    print(f"[GPU] Color set to #{args.color.lstrip('#')} (Mode: {mode_name}).")
+            else:
+                gpu.set_mode(mode_code)
+                print(f"[GPU] Mode set to {mode_name}.")
 
     elif args.command == "mobo":
         if args.off:
             mobo.set_mode(MOBO_MODES["off"])
             print("[MOBO] LEDs turned off.")
-        elif args.color and args.mode == "static":
-            r, g, b = parse_hex_color(args.color)
-            mobo.set_color_static(r, g, b)
-            print(f"[MOBO] Static color set to #{args.color.lstrip('#')}.")
         else:
-            mode_code = MOBO_MODES[args.mode]
-            mobo.set_mode(mode_code, speed=args.speed)
-            print(f"[MOBO] Mode set to {args.mode} (Speed: {args.speed}).")
+            mode_name = resolve_mobo_mode(args.mode)
+            mode_code = MOBO_MODES[mode_name]
+            rgb = parse_hex_color(args.color) if args.color else None
+            if rgb and mode_name == "static":
+                mobo.set_color_static(*rgb)
+                print(f"[MOBO] Static color set to #{args.color.lstrip('#')}.")
+            elif rgb and mode_name in MOBO_COLOR_MODES:
+                mobo.set_effect(mode_code, speed=args.speed, color=rgb)
+                print(f"[MOBO] Mode set to {mode_name} with color #{args.color.lstrip('#')} (Speed: {args.speed}).")
+            else:
+                if rgb:
+                    print("warning: --color is ignored for effect modes that generate their own colors", file=sys.stderr)
+                mobo.set_mode(mode_code, speed=args.speed)
+                print(f"[MOBO] Mode set to {mode_name} (Speed: {args.speed}).")
 
     elif args.command == "all":
         if args.off:
@@ -532,16 +631,27 @@ def main():
             mobo.set_mode(MOBO_MODES["off"])
             print("[ALL] GPU and Motherboard LEDs turned off.")
         else:
-            r, g, b = parse_hex_color(args.color)
-            gpu_mode = GPU_MODES.get(args.mode, GPU_MODES["static"])
-            mobo_mode = MOBO_MODES.get(args.mode, MOBO_MODES["static"])
-
-            gpu.set_color(r, g, b, mode=gpu_mode)
-            if mobo_mode == 1:
-                mobo.set_color_static(r, g, b)
+            rgb = parse_hex_color(args.color) if args.color else None
+            gpu_name, mobo_name = resolve_all_mode(args.mode)
+            if rgb is None and mobo_name == "static":
+                parser.error("--color is required for static mode")
+            hex_color = (args.color or "").lstrip("#")
+            if rgb:
+                gpu.set_color(*rgb, mode=GPU_MODES[gpu_name])
             else:
-                mobo.set_mode(mobo_mode)
-            print(f"[ALL] Synchronized GPU and Motherboard to #{args.color.lstrip('#')} (Mode: {args.mode}).")
+                gpu.set_mode(GPU_MODES[gpu_name])
+            if rgb and mobo_name == "static":
+                mobo.set_color_static(*rgb)
+            elif rgb and mobo_name in MOBO_COLOR_MODES:
+                mobo.set_effect(MOBO_MODES[mobo_name], color=rgb)
+            else:
+                mobo.set_effect(MOBO_MODES[mobo_name])
+            if rgb and (mobo_name == "static" or mobo_name in MOBO_COLOR_MODES):
+                print(f"[ALL] Synchronized GPU and Motherboard to #{hex_color} (Mode: {args.mode}).")
+            elif rgb:
+                print(f"[ALL] GPU mode {gpu_name}; motherboard mode {mobo_name} (hardware-generated colors; --color ignored).")
+            else:
+                print(f"[ALL] GPU mode {gpu_name}; motherboard mode {mobo_name} (colors unchanged).")
 
 
 if __name__ == "__main__":

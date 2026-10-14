@@ -2,6 +2,7 @@
 name = "luminactl"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.89"
 description = "Pure Linux CLI, MCP server, and Web Studio for RGB lighting — reverse-engineered for ASUS Aura Sync hardware"
 license = "MIT"
 repository = "https://github.com/alexkala1/luminactl"

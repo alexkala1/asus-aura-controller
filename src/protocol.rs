@@ -28,7 +28,8 @@ pub const GPU_REG_RED: u8 = 0x04;
 pub const GPU_REG_GREEN: u8 = 0x05;
 pub const GPU_REG_BLUE: u8 = 0x06;
 pub const GPU_REG_MODE: u8 = 0x07;
-pub const GPU_REG_APPLY: u8 = 0x0E;
+// Vendor fnSetLEDEFFECT writes mode directly. 0x0C belongs to fnSetLEDFrame;
+// 0x0E belongs to fnSetLEDBurn, so neither is a routine mode/apply register.
 pub const GPU_REG_MAGIC_H: u8 = 0x20;
 pub const GPU_REG_MAGIC_L: u8 = 0x21;
 

@@ -135,15 +135,25 @@ fn mobo_controller(dry_run: bool) -> Result<MoboController<Box<dyn PortIo>>, Str
 }
 
 fn human_status(gpu: &GpuStatus, mobo: &MoboStatus) -> String {
+    let gpu_color = if gpu.color_source == "autonomous" {
+        "hardware-generated (stored RGB is not the live color)".to_owned()
+    } else {
+        format!("#{}", gpu.color_hex)
+    };
     let mut text = format!(
-        "==================================================\n  Lumina Hardware Status (Live)\n==================================================\n[GPU]  {}\n       Bus: {} @ {} (Magic 0x1589 Verified)\n       Mode: {}, Color: #{}\n--------------------------------------------------\n[MOBO] {}\n       Super I/O Port: {} @ {} ({} Verified)\n       Mode: {}, Speed: {}, Direction: {}\n",
-        gpu.device, gpu.bus, gpu.address, gpu.mode, gpu.color_hex, mobo.device,
+        "==================================================\n  Lumina Hardware Status (Live)\n==================================================\n[GPU]  {}\n       Bus: {} @ {} (Magic 0x1589 Verified)\n       Mode: {}, Color: {}\n--------------------------------------------------\n[MOBO] {}\n       Super I/O Port: {} @ {} ({} Verified)\n       Mode: {}, Speed: {}, Direction: {}\n",
+        gpu.device, gpu.bus, gpu.address, gpu.mode, gpu_color, mobo.device,
         mobo.smbus_port, mobo.slave_address, mobo.firmware, mobo.mode, mobo.speed, mobo.direction
     );
     for zone in &mobo.zones {
+        let color = if mobo.color_source == "autonomous" {
+            "hardware-generated (stored RGB is not the live color)".to_owned()
+        } else {
+            format!("#{}", zone.hex)
+        };
         text.push_str(&format!(
-            "       - LED {} ({}): #{}\n",
-            zone.led_index, zone.channel_name, zone.hex
+            "       - LED {} ({}): {}\n",
+            zone.led_index, zone.channel_name, color
         ));
     }
     text.push_str("==================================================");
@@ -171,6 +181,11 @@ pub fn run(cli: Cli) -> Result<String, String> {
             } else if let Some(color) = color {
                 let (r, g, b) = parse_hex_color(&color)?;
                 gpu_controller(dry)?.set_color(r, g, b, mode)?;
+                if mode == GpuMode::Spectrum {
+                    return Ok(
+                        "[GPU] Spectrum generates its own colors; --color ignored.".to_owned()
+                    );
+                }
                 Ok(format!(
                     "[GPU] Color set to #{} (Mode: {}).",
                     color.trim_start_matches('#'),
@@ -246,8 +261,18 @@ pub fn run(cli: Cli) -> Result<String, String> {
                 Some(_) if mobo_mode == MoboMode::Static || mobo_mode.uses_color() => {
                     format!("[ALL] Synchronized GPU and Motherboard to #{hex} (Mode: {mode}).")
                 }
+                Some(_) if gpu_mode == GpuMode::Spectrum => format!(
+                    "[ALL] GPU mode {}; motherboard mode {} (hardware-generated colors; --color ignored).",
+                    gpu_mode.name(),
+                    mobo_mode.name()
+                ),
                 Some(_) => format!(
                     "[ALL] GPU set to #{hex} (Mode: {}); motherboard effect {} generates its own colors.",
+                    gpu_mode.name(),
+                    mobo_mode.name()
+                ),
+                None if gpu_mode == GpuMode::Spectrum && !mobo_mode.uses_color() => format!(
+                    "[ALL] GPU mode {}; motherboard mode {} (hardware-generated colors).",
                     gpu_mode.name(),
                     mobo_mode.name()
                 ),
@@ -381,7 +406,7 @@ mod cli_tests {
         let cli = Cli::try_parse_from(["luminactl", "--dry-run", "status"]).unwrap();
         let text = run(cli).unwrap();
         assert!(text.contains("Lumina Hardware Status (Live)"));
-        assert!(text.contains("LED 4 (RGB Header 1): #000000"));
+        assert!(text.contains("LED 4 (RGB Header 1): hardware-generated"));
     }
 
     #[test]
@@ -414,11 +439,11 @@ mod cli_tests {
             ),
             (
                 vec!["all", "--color", "112233", "--mode", "rainbow"],
-                "[ALL] GPU set to #112233 (Mode: spectrum); motherboard effect rainbow generates its own colors.",
+                "[ALL] GPU mode spectrum; motherboard mode rainbow (hardware-generated colors; --color ignored).",
             ),
             (
                 vec!["all", "--color", "112233", "--mode", "rainbow_breathing"],
-                "[ALL] GPU set to #112233 (Mode: spectrum); motherboard effect rainbow_breathing generates its own colors.",
+                "[ALL] GPU mode spectrum; motherboard mode rainbow_breathing (hardware-generated colors; --color ignored).",
             ),
         ] {
             let cli = Cli::try_parse_from(["luminactl", "--dry-run"].into_iter().chain(args)).unwrap();

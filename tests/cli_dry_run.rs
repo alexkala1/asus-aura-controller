@@ -73,7 +73,7 @@ fn status_json_reports_verified_devices_and_five_zones() {
 }
 
 #[test]
-fn gpu_color_writes_rgb_mode_then_apply() {
+fn gpu_color_writes_rgb_and_mode_without_burn() {
     let stdout = successful_stdout(&["gpu", "--color", "00ffcc"]);
     let writes: Vec<_> = stdout
         .lines()
@@ -86,9 +86,26 @@ fn gpu_color_writes_rgb_mode_then_apply() {
             "[DRY-RUN] GPU Write: Reg 0x05 <= 0xff",
             "[DRY-RUN] GPU Write: Reg 0x06 <= 0xcc",
             "[DRY-RUN] GPU Write: Reg 0x07 <= 0x01",
-            "[DRY-RUN] GPU Write: Reg 0x0e <= 0x01",
         ]
     );
+}
+
+#[test]
+fn autonomous_gpu_aliases_ignore_optional_colors_without_changing_stored_rgb() {
+    for mode in ["spectrum", "rainbow", "color-cycle"] {
+        let stdout = successful_stdout(&["gpu", "--mode", mode, "--color", "112233"]);
+        let writes: Vec<_> = stdout
+            .lines()
+            .filter(|line| line.starts_with("[DRY-RUN] GPU Write:"))
+            .collect();
+        assert_eq!(writes, ["[DRY-RUN] GPU Write: Reg 0x07 <= 0x04",]);
+        assert!(stdout.contains("--color ignored"));
+        assert!(!stdout.contains("Color set to #112233"));
+    }
+    let stdout = successful_stdout(&["all", "--mode", "rainbow", "--color", "112233"]);
+    assert!(stdout.contains("hardware-generated colors; --color ignored"));
+    assert!(!stdout.contains("Reg 0x04 <="));
+    assert!(!stdout.contains("Reg 0x8010 <="));
 }
 
 #[test]
@@ -238,7 +255,7 @@ fn all_autonomous_effects_leave_direct_mode_and_do_not_claim_the_color() {
             "0x80a0 <= 0x01"
         ]
     );
-    assert!(stdout.contains("generates its own colors"));
+    assert!(stdout.contains("hardware-generated colors; --color ignored"));
     assert!(!stdout.contains("Synchronized"));
 }
 
@@ -253,8 +270,8 @@ fn gpu_writes(stdout: &str) -> Vec<String> {
 #[test]
 fn all_rainbow_needs_no_color_and_runs_gpu_spectrum_plus_mobo_rainbow() {
     let stdout = successful_stdout(&["all", "--mode", "rainbow"]);
-    // GPU: mode register = 4 (spectrum), applied; no color registers touched.
-    assert_eq!(gpu_writes(&stdout), ["0x07 <= 0x04", "0x0e <= 0x01"]);
+    // GPU: vendor mode request writes only 0x07; no color/frame/burn writes.
+    assert_eq!(gpu_writes(&stdout), ["0x07 <= 0x04"]);
     // Motherboard: leave direct mode, select rainbow (5), apply; no color buffer writes.
     assert_eq!(
         mobo_writes(&stdout),
@@ -280,7 +297,7 @@ fn all_static_without_color_fails_before_touching_a_device() {
 #[test]
 fn gpu_rainbow_is_the_spectrum_mode() {
     let stdout = successful_stdout(&["gpu", "--mode", "rainbow"]);
-    assert_eq!(gpu_writes(&stdout), ["0x07 <= 0x04", "0x0e <= 0x01"]);
+    assert_eq!(gpu_writes(&stdout), ["0x07 <= 0x04"]);
 }
 
 #[test]

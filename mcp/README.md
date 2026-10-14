@@ -12,14 +12,14 @@ Include `~/.cargo/bin` in your MCP client's PATH. Alternatively, run
 `cargo build --release --locked` and replace the dry-run config's `command`
 with the absolute path to `target/release/luminactl` in your checkout.
 
-`antigravity-aura.json` and `claude_desktop_config.json` use
+`antigravity-lumina.json` and `claude_desktop_config.json` use
 `sudo -n /usr/local/bin/luminactl mcp` for live hardware access. Install
 the binary in that root-owned location:
 
 ```sh
 cargo build --release --locked
 sudo install -o root -g root -m 0755 target/release/luminactl /usr/local/bin/luminactl
-sudo visudo -f /etc/sudoers.d/99-aura-mcp
+sudo visudo -f /etc/sudoers.d/99-lumina-mcp
 ```
 
 Add this rule, replacing `YOUR_USERNAME` with your login name:

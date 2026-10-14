@@ -92,10 +92,11 @@ pub struct MoboStatus {
     pub mode: String,
     pub speed: u8,
     pub direction: String,
-    /// Which configured-color buffer `zones` was read from: "direct" when direct mode
-    /// is enabled, otherwise "effect". Effect colors are the configured color, not an
-    /// instantaneous sample of an animation.
+    /// "autonomous" means the firmware generates colors; buffer contents are not
+    /// instantaneous animation samples. Otherwise "direct" or "effect" identifies
+    /// the configured-color buffer used by the controller.
     pub color_source: String,
+    pub color_configurable: bool,
     pub zones: Vec<MoboZone>,
 }
 
@@ -260,11 +261,14 @@ impl<P: PortIo> MoboController<P> {
         let speed = self.ene_read_reg(MOBO_REG_SPEED)?;
         let direction = self.ene_read_reg(MOBO_REG_DIRECTION)?;
         let direct = self.ene_read_reg(MOBO_REG_DIRECT)? != 0;
-        let (color_base, color_source) = if direct {
+        let (color_base, buffer_source) = if direct {
             (MOBO_REG_COLORS_DIRECT, "direct")
         } else {
             (MOBO_REG_COLORS_EFFECT, "effect")
         };
+        let decoded_mode = MoboMode::from_code(mode);
+        let autonomous =
+            !direct && decoded_mode.is_some_and(|mode| mode != MoboMode::Off && !mode.uses_color());
         let mut zones = Vec::with_capacity(usize::from(led_count));
         for i in 0..led_count {
             let channel = self.ene_read_reg(MOBO_REG_CONFIG + 0x13 + u16::from(i))?;
@@ -292,7 +296,13 @@ impl<P: PortIo> MoboController<P> {
                 .unwrap_or_else(|| format!("unknown({mode})")),
             speed,
             direction: if direction == 0 { "forward" } else { "reverse" }.to_owned(),
-            color_source: color_source.to_owned(),
+            color_source: if autonomous {
+                "autonomous"
+            } else {
+                buffer_source
+            }
+            .to_owned(),
+            color_configurable: direct || decoded_mode.is_some_and(MoboMode::uses_color),
             zones,
         })
     }
@@ -362,7 +372,9 @@ impl<P: PortIo> MoboController<P> {
         self.verify()?;
         let count = self.led_count()?;
         self.ene_write_reg(MOBO_REG_DIRECT, 0)?;
-        if let Some((r, g, b)) = color {
+        if let Some((r, g, b)) =
+            color.filter(|_| !matches!(mode, MoboMode::Spectrum | MoboMode::Rainbow))
+        {
             for i in 0..count {
                 for (offset, byte) in pack_mobo_color(r, g, b).into_iter().enumerate() {
                     self.ene_write_reg(
@@ -660,12 +672,42 @@ mod tests {
         // Effect buffer bytes are red, blue, green; the inactive direct buffer differs.
         let status = ctl.status().unwrap();
         assert_eq!(status.color_source, "effect");
+        assert!(status.color_configurable);
         assert_eq!(status.zones[0].hex, "aabbcc");
         assert_eq!(status.mode, "breathing");
         ctl.set_color_static(0x44, 0x55, 0x66).unwrap();
         let status = ctl.status().unwrap();
         assert_eq!(status.color_source, "direct");
+        assert!(status.color_configurable);
         assert_eq!(status.zones[4].hex, "445566");
+    }
+
+    #[test]
+    fn autonomous_status_distinguishes_zero_buffers_from_an_off_color() {
+        for mode in [MoboMode::Spectrum, MoboMode::Rainbow] {
+            let mut ctl = MoboController::new(MockPort::valid(5), false);
+            ctl.set_mode(mode, 0, 0).unwrap();
+            let status = ctl.status().unwrap();
+            assert_eq!(status.mode, mode.name());
+            assert_eq!(status.color_source, "autonomous");
+            assert!(!status.color_configurable);
+            assert!(status.zones.iter().all(|zone| zone.hex == "000000"));
+            ctl.set_color_static(0x11, 0x22, 0x33).unwrap();
+            let status = ctl.status().unwrap();
+            assert_eq!(status.color_source, "direct");
+            assert!(status.color_configurable);
+            assert_eq!(status.zones[0].hex, "112233");
+        }
+        // Direct mode wins even if a stale effect code remains in the mode register.
+        let mut ctl = MoboController::new(MockPort::valid(5), false);
+        ctl.set_color_static(0x11, 0x22, 0x33).unwrap();
+        ctl.port
+            .regs
+            .insert(MOBO_REG_MODE, MoboMode::Rainbow.code());
+        let status = ctl.status().unwrap();
+        assert_eq!(status.color_source, "direct");
+        assert!(status.color_configurable);
+        assert_eq!(status.zones[0].hex, "112233");
     }
 
     #[test]

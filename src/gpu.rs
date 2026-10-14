@@ -6,8 +6,8 @@ use std::io;
 use std::os::fd::AsRawFd;
 
 use crate::protocol::{
-    GpuMode, GPU_I2C_ADDR, GPU_MAGIC_HIGH, GPU_MAGIC_LOW, GPU_REG_APPLY, GPU_REG_BLUE,
-    GPU_REG_GREEN, GPU_REG_MAGIC_H, GPU_REG_MAGIC_L, GPU_REG_MODE, GPU_REG_RED,
+    GpuMode, GPU_I2C_ADDR, GPU_MAGIC_HIGH, GPU_MAGIC_LOW, GPU_REG_BLUE, GPU_REG_GREEN,
+    GPU_REG_MAGIC_H, GPU_REG_MAGIC_L, GPU_REG_MODE, GPU_REG_RED,
 };
 
 const I2C_SLAVE: c_ulong = 0x0703;
@@ -136,6 +136,9 @@ pub struct GpuStatus {
     pub address: String,
     pub magic_verified: bool,
     pub mode: String,
+    /// Spectrum generates colors internally; RGB registers are not animation samples.
+    pub color_source: String,
+    pub color_configurable: bool,
     pub color_hex: String,
     pub rgb: [u8; 3],
 }
@@ -196,19 +199,32 @@ impl<B: I2cBus> GpuController<B> {
             mode: GpuMode::from_code(code)
                 .map(|mode| mode.name().to_owned())
                 .unwrap_or_else(|| format!("unknown({code})")),
+            color_source: if code == GpuMode::Spectrum.code() {
+                "autonomous"
+            } else {
+                "configured"
+            }
+            .to_owned(),
+            color_configurable: matches!(
+                GpuMode::from_code(code),
+                Some(GpuMode::Static | GpuMode::Breathing | GpuMode::Flashing)
+            ),
             color_hex: format!("{r:02x}{g:02x}{b:02x}"),
             rgb: [r, g, b],
         })
     }
 
     pub fn set_color(&mut self, r: u8, g: u8, b: u8, mode: GpuMode) -> Result<(), String> {
+        if mode == GpuMode::Spectrum {
+            // The firmware generates this effect's colors; leave stored RGB intact.
+            return self.set_mode(mode);
+        }
         self.require_signature()?;
         for (reg, val) in [
             (GPU_REG_RED, r),
             (GPU_REG_GREEN, g),
             (GPU_REG_BLUE, b),
             (GPU_REG_MODE, mode.code()),
-            (GPU_REG_APPLY, 1),
         ] {
             self.bus.write_reg(reg, val).map_err(|e| e.to_string())?;
         }
@@ -237,7 +253,6 @@ impl<B: I2cBus> GpuController<B> {
             (GPU_REG_GREEN, g),
             (GPU_REG_BLUE, b),
             (GPU_REG_MODE, snapshot.mode),
-            (GPU_REG_APPLY, 1),
         ] {
             self.bus.write_reg(reg, val).map_err(|e| e.to_string())?;
         }
@@ -248,9 +263,6 @@ impl<B: I2cBus> GpuController<B> {
         self.require_signature()?;
         self.bus
             .write_reg(GPU_REG_MODE, mode.code())
-            .map_err(|e| e.to_string())?;
-        self.bus
-            .write_reg(GPU_REG_APPLY, 1)
             .map_err(|e| e.to_string())
     }
 }
@@ -259,6 +271,23 @@ impl<B: I2cBus> GpuController<B> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn spectrum_status_does_not_claim_stored_rgb_is_the_live_color() {
+        let mut bus = MockI2c::valid();
+        bus.regs.insert(GPU_REG_MODE, GpuMode::Spectrum.code());
+        let mut ctl = GpuController::new(bus, crate::protocol::GPU_I2C_DEV);
+        let status = ctl.status().unwrap();
+        assert_eq!(status.mode, "spectrum");
+        assert_eq!(status.color_source, "autonomous");
+        assert!(!status.color_configurable);
+        assert_eq!(status.color_hex, "000000"); // Raw bytes remain compatible.
+        ctl.set_color(0x11, 0x22, 0x33, GpuMode::Static).unwrap();
+        let status = ctl.status().unwrap();
+        assert_eq!(status.color_source, "configured");
+        assert!(status.color_configurable);
+        assert_eq!(status.color_hex, "112233");
+    }
 
     #[derive(Default)]
     struct MockI2c {
@@ -320,20 +349,17 @@ mod tests {
         let mut gpu = GpuController::new(MockI2c::valid(), "/dev/i2c-0");
         gpu.set_color(0x11, 0x22, 0x33, GpuMode::Breathing).unwrap();
         assert_eq!(gpu.bus.reads, [0x20, 0x21]);
-        assert_eq!(
-            gpu.bus.writes,
-            [(4, 0x11), (5, 0x22), (6, 0x33), (7, 2), (0xE, 1)]
-        );
+        assert_eq!(gpu.bus.writes, [(4, 0x11), (5, 0x22), (6, 0x33), (7, 2)]);
     }
 
     #[test]
     fn set_mode_write_order_and_reverifies() {
         let mut gpu = GpuController::new(MockI2c::valid(), "/dev/i2c-0");
         gpu.set_mode(GpuMode::Flashing).unwrap();
-        assert_eq!(gpu.bus.writes, [(7, 3), (0xE, 1)]);
+        assert_eq!(gpu.bus.writes, [(7, 3)]);
         gpu.bus.regs.insert(0x21, 0);
         assert_eq!(gpu.set_mode(GpuMode::Off).unwrap_err(), SIGNATURE_MISMATCH);
-        assert_eq!(gpu.bus.writes.len(), 2);
+        assert_eq!(gpu.bus.writes.len(), 1);
         assert_eq!(gpu.bus.reads, [0x20, 0x21, 0x20, 0x21]);
     }
 
@@ -369,7 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn transport_errors_stop_before_apply() {
+    fn transport_errors_stop_remaining_writes() {
         let mut bus = MockI2c::valid();
         bus.fail_read = Some(0x21);
         let mut gpu = GpuController::new(bus, "mock");

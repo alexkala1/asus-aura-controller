@@ -213,3 +213,82 @@ class TestAuraController(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCliParityWithRust(unittest.TestCase):
+    """Dry-run only: the CLI is run as a subprocess, so no device file is ever opened."""
+
+    @staticmethod
+    def run_cli(*args):
+        result = subprocess.run([sys.executable, "-I", os.path.join(os.path.dirname(__file__), "..", "lumina_ctl.py"),
+                                 "--dry-run", *args], capture_output=True, text=True, timeout=20)
+        writes = [line.split("Reg ", 1)[1] for line in result.stdout.splitlines() if "Write:" in line]
+        return result, writes
+
+    def test_all_off_needs_no_color(self):
+        result, writes = self.run_cli("all", "--off")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("GPU and Motherboard LEDs turned off", result.stdout)
+
+    def test_all_rainbow_needs_no_color_runs_gpu_spectrum_and_leaves_direct_mode(self):
+        result, writes = self.run_cli("all", "--mode", "rainbow")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([w for w in writes if w.startswith("0x07") or w.startswith("0x0e")], ["0x07 <= 0x04", "0x0e <= 0x01"])
+        mobo = [w for w in writes if w.startswith("0x80")]
+        self.assertEqual(mobo, ["0x8020 <= 0x00", "0x8021 <= 0x05", "0x8022 <= 0x00", "0x8023 <= 0x00", "0x80a0 <= 0x01"])
+
+    def test_static_still_requires_a_color_and_unknown_modes_are_errors(self):
+        result, writes = self.run_cli("all")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--color is required for static mode", result.stderr)
+        self.assertEqual(writes, [])
+        result, writes = self.run_cli("all", "--color", "112233", "--mode", "bogus")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(writes, [])
+
+    def test_color_driven_effect_writes_the_effect_buffer(self):
+        result, writes = self.run_cli("mobo", "--color", "112233", "--mode", "breathing", "--speed", "2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = ["0x8020 <= 0x00"]
+        for led in range(5):
+            expected += [f"0x{0x8010 + 3 * led + o:04x} <= {b}" for o, b in enumerate(("0x11", "0x33", "0x22"))]
+        expected += ["0x8021 <= 0x02", "0x8022 <= 0x02", "0x8023 <= 0x00", "0x80a0 <= 0x01"]
+        self.assertEqual(writes, expected)
+
+    def test_autonomous_effect_with_color_warns_and_writes_no_color_buffer(self):
+        result, writes = self.run_cli("mobo", "--color", "112233", "--mode", "rainbow")
+        self.assertIn("--color is ignored", result.stderr)
+        self.assertFalse(any(w.startswith("0x8010") for w in writes))
+
+    def test_aliases_and_gpu_rainbow(self):
+        for args, first in [(("gpu", "--mode", "rainbow"), "0x07 <= 0x04"), (("gpu", "--mode", "strobing"), "0x07 <= 0x03"),
+                            (("mobo", "--mode", "comet"), "0x8020 <= 0x00")]:
+            result, writes = self.run_cli(*args)
+            self.assertEqual(result.returncode, 0, (args, result.stderr))
+            self.assertEqual(writes[0], first, args)
+        result, writes = self.run_cli("mobo", "--mode", "comet")
+        self.assertIn("0x8021 <= 0x07", writes)
+
+    def test_mode_change_after_static_clears_direct_mode_first(self):
+        mobo = lumina_ctl.MoboAuraController(dry_run=True)
+        seen = []
+        mobo.ene_write_reg = lambda reg, val: seen.append((reg, val))
+        mobo.set_mode(lumina_ctl.MOBO_MODES["rainbow"], 1)
+        self.assertEqual(seen[0], (lumina_ctl.MOBO_REG_DIRECT, 0))
+        self.assertLess(seen.index((lumina_ctl.MOBO_REG_DIRECT, 0)), seen.index((lumina_ctl.MOBO_REG_APPLY, 1)))
+        seen.clear()
+        mobo.set_mode(lumina_ctl.MOBO_MODES["static"])  # static keeps the current buffer
+        self.assertNotIn(lumina_ctl.MOBO_REG_DIRECT, [reg for reg, _ in seen])
+
+    def test_status_reports_the_active_color_buffer(self):
+        for direct, base, source in [(1, lumina_ctl.MOBO_REG_COLORS_DIRECT, "direct"), (0, lumina_ctl.MOBO_REG_COLORS_EFFECT, "effect")]:
+            regs = {lumina_ctl.MOBO_REG_DIRECT: direct, lumina_ctl.MOBO_REG_CONFIG + 2: 5,
+                    base: 0xaa, base + 1: 0xcc, base + 2: 0xbb}
+            mobo = lumina_ctl.MoboAuraController(port_path=os.devnull)
+            mobo.open = lambda: None
+            mobo.close = lambda: None
+            mobo.verify = lambda: "LED-0116"
+            mobo.ene_read_reg = lambda reg, regs=regs: regs.get(reg, 0)
+            status = mobo.get_status()
+            self.assertEqual(status["color_source"], source)
+            self.assertEqual(status["zones"][0]["hex"], "aabbcc")

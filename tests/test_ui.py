@@ -395,6 +395,29 @@ def test_autonomous_refresh_preserves_last_configured_color_for_later_static(pag
     expect(page.locator("#command-preview")).to_have_text("sudo luminactl gpu --color ff0055 --mode static")
 
 
+def test_direct_buffer_overrides_stale_rainbow_mode_and_can_stage_a_new_effect(page, daemon):
+    mobo = daemon["data"]["motherboard"]
+    mobo.update(mode="rainbow", color_source="direct", color_configurable=True)
+    for zone in mobo["zones"]:
+        zone["hex"] = "112233"
+    page.goto(URL, wait_until="networkidle")
+    expect(page.locator("#mobo-mode")).to_have_value("static")
+    expect(page.locator("#mobo-color")).to_be_enabled()
+    expect(page.locator("#mobo .hex-value")).to_have_text("#112233")
+    set_color(page, "#mobo-color", "#445566")
+    page.locator("#btn-apply").click()
+    expect(page.locator("#status-toast")).to_have_text("✓ Applied to hardware.")
+    assert daemon["writes"][-1]["mode"] == "static"
+    assert daemon["writes"][-1]["color"] == "445566"
+    page.locator("#mobo-mode").select_option("rainbow")
+    expect(page.locator("#mobo-color")).to_be_disabled()
+    expect(page.locator("#mobo .hex-value")).to_have_text("Auto")
+    page.locator("#btn-apply").click()
+    expect(page.locator("#status-toast")).to_have_text("✓ Applied to hardware.")
+    assert daemon["writes"][-1]["mode"] == "rainbow"
+    assert "color" not in daemon["writes"][-1]
+
+
 @pytest.mark.parametrize("source, mode", [("direct", "static"), ("effect", "breathing")])
 def test_configurable_color_metadata_keeps_real_black_and_effect_colors(page, daemon, source, mode):
     gpu = daemon["data"]["gpu"]
@@ -499,3 +522,47 @@ def test_daemon_status_failure_has_no_synthetic_fallback(monkeypatch):
     handler.handle_post_apply()
     assert len(calls) == 1
     assert responses[-1][0] == 400
+
+
+@pytest.mark.parametrize("fulfil, expected", [
+    ({"status": 503, "body": ""}, "daemon is busy"),
+    ({"status": 501, "body": "<html>nope</html>", "content_type": "text/html"}, "does not support that request"),
+    ({"status": 404, "body": "gone", "content_type": "text/plain"}, "does not know that request"),
+    ({"status": 200, "body": "not json at all", "content_type": "application/json"}, "Daemon request failed (200)"),
+    ({"status": 503, "json": {"ok": False, "error": "Permission denied"}}, "Permission denied"),
+])
+def test_non_json_daemon_errors_get_friendly_banners(page, daemon, fulfil, expected):
+    page.unroute(f"{URL}/**")
+    base = page
+
+    def handle(route):
+        path = route.request.url.removeprefix(URL).split("?")[0]
+        if path == "/api/status":
+            route.fulfill(**fulfil)
+        else:
+            asset = WEB / (path.lstrip("/") or "index.html")
+            route.fulfill(body=asset.read_bytes(), content_type=mimetypes.guess_type(asset)[0] or "application/octet-stream")
+
+    base.route(f"{URL}/**", handle)
+    page.goto(URL, wait_until="networkidle")
+    expect(page.locator("#live-status")).to_have_text("● OFFLINE")
+    help_text = page.locator("#connection-help").inner_text()
+    assert expected in help_text, help_text
+    for raw in ("Unexpected end of JSON", "Unexpected token", "Failed to execute"):
+        assert raw not in help_text
+
+
+def test_unreachable_daemon_gets_a_friendly_banner(page, daemon):
+    page.unroute(f"{URL}/**")
+
+    def handle(route):
+        path = route.request.url.removeprefix(URL).split("?")[0]
+        if path == "/api/status":
+            route.abort("connectionrefused")
+        else:
+            asset = WEB / (path.lstrip("/") or "index.html")
+            route.fulfill(body=asset.read_bytes(), content_type=mimetypes.guess_type(asset)[0] or "application/octet-stream")
+
+    page.route(f"{URL}/**", handle)
+    page.goto(URL, wait_until="networkidle")
+    expect(page.locator("#connection-help")).to_contain_text("Cannot reach the daemon")

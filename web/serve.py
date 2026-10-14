@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 WEB_DIR = ROOT_DIR / "web"
@@ -123,17 +124,49 @@ class LuminaRequestHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         sys.stderr.write(f"[lumina-server] {format % args}\n")
 
+    @property
+    def route(self):
+        """Request path without the query string or fragment (`/api/status?x=1`)."""
+        return urlsplit(self.path).path
+
     def do_GET(self):
-        if self.path == "/api/status":
+        if self.route == "/api/status":
             self.handle_get_status()
         else:
             super().do_GET()
 
+    def do_HEAD(self):
+        if self.route == "/api/status":
+            # Liveness probe: same headers as GET, but never drives the hardware.
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            super().do_HEAD()
+
     def do_POST(self):
-        if self.path == "/api/apply":
+        if self.route == "/api/apply":
             self.handle_post_apply()
         else:
             self.send_error(404, "Endpoint not found")
+
+    def _method_not_allowed(self):
+        allow = "GET, HEAD, POST, OPTIONS"
+        payload = json.dumps({"ok": False, "error": f"Method {self.command} is not allowed. Use {allow}."}).encode()
+        self.close_connection = True  # a body we never read may follow
+        try:
+            self.send_response(405)
+            self.send_header("Allow", allow)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError, socket.timeout):
+            pass
+
+    do_PUT = do_PATCH = do_DELETE = _method_not_allowed
 
     def handle_get_status(self):
         cmd = ["sudo", "-n", str(CLI_BIN), "--json", "status"]

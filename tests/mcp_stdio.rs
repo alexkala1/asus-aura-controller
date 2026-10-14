@@ -323,7 +323,7 @@ fn oversized_message_is_discarded_then_ping_succeeds() {
 
 #[test]
 fn signals_restore_baseline_and_exit_cleanly() {
-    for signal in ["-TERM", "-INT"] {
+    for signal in ["-TERM", "-INT", "-HUP", "-QUIT"] {
         let mut client = Client::start();
         assert_eq!(
             client.tool("lumina_agent_state", json!({"state": "working"}))["isError"],
@@ -550,5 +550,49 @@ fn rainbow_effect_without_a_color_puts_gpu_in_spectrum_and_mobo_in_rainbow() {
     assert!(
         !stderr.contains("Reg 0x04 <="),
         "no GPU color register without a color"
+    );
+}
+
+#[test]
+fn batches_are_answered_as_an_array_and_notifications_stay_silent() {
+    let mut client = Client::start();
+    client.send(json!([
+        {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": "b", "method": "tools/list"},
+        {"jsonrpc": "2.0", "id": 3, "method": "nope"},
+    ]));
+    let reply = client.try_read(Duration::from_secs(5)).unwrap();
+    let items = reply.as_array().expect("array reply");
+    assert_eq!(items.len(), 3, "the notification gets no entry: {reply}");
+    assert_eq!(items[0]["id"], 1);
+    assert_eq!(items[1]["id"], "b");
+    assert_eq!(items[2]["error"]["code"], -32601);
+    // A batch of only notifications produces no output at all; the next reply is the ping.
+    client.send(json!([{"jsonrpc": "2.0", "method": "notifications/initialized"}]));
+    assert_eq!(client.request("ping", json!({}))["result"], json!({}));
+    // An empty batch is an invalid request.
+    client.send(json!([]));
+    assert_eq!(
+        client.try_read(Duration::from_secs(5)).unwrap()["error"]["code"],
+        -32600
+    );
+}
+
+#[test]
+fn null_ids_are_invalid_requests_but_missing_ids_are_notifications() {
+    let mut client = Client::start();
+    client.send(json!({"jsonrpc": "2.0", "id": null, "method": "ping"}));
+    let reply = client.try_read(Duration::from_secs(5)).unwrap();
+    assert_eq!(reply["error"]["code"], -32600);
+    assert_eq!(reply["id"], Value::Null);
+    // No `id` member: a notification, so no reply even for a request-shaped method.
+    client.send(json!({"jsonrpc": "2.0", "method": "ping"}));
+    assert_eq!(client.request("ping", json!({}))["id"], 1);
+    // Scalars are not requests.
+    client.send(json!(7));
+    assert_eq!(
+        client.try_read(Duration::from_secs(5)).unwrap()["error"]["code"],
+        -32600
     );
 }
