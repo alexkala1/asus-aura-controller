@@ -270,3 +270,207 @@ Inference: 8-bit commands `0xA0`/`0xF1` alias the `0x80A0`/`0x80F1` high-page re
 | 0x2e/0x2f Super-I/O `LED-0116` read path on Z270E | luminactl-only (live read); no vendor counterpart |
 
 Bounded negative searches: the `LED-0116` string search covered every file under `upstream_binaries/` (ASCII and UTF-16); the register-constant scan covered the `.text` sections of `Aac3572MbHal_x64.exe`, `LED_DLL_forMB_x64.dll`, `Vender_x64.dll`, `AacVgaHal_x64.dll`, `LightingService.exe`, `aaHMLib.dll`, `MBIsSupported.dll` and found no ENE register immediates, with two caveats: `LED_DLL_forMB_x64.dll` and `Vender_x64.dll` each have one `mov r12d, 0x8020` hit that was not examined (likely MFC/CRT flag code, unverified), and `VGA_Extra_x64.dll` was not immediate-scanned because its `0xCE` path was read directly from the decompilation (§3.5).
+
+> **Phase 2 update.** The `0x0C`/`0x0D` "callers not analysed" unknown above is now partly answered: `AacVgaHal_x64.dll` has no call site for `fnSetLEDFrame` (§5.2). The `0x8020` hits in `LED_DLL_forMB_x64.dll`/`Vender_x64.dll` remain unexamined. See §5–§7.
+
+## 5. GPU effects: speed, direction and frame sync (`AacVgaHal_x64.dll`)
+
+Phase 2 method: Ghidra 12.1.2 (REA 6.3.0 for the first xref/loader reads, then Ghidra headless scripts after the REA MCP server dropped mid-session). Binaries (sha256 prefix): `AacVgaHal_x64.dll c1732b2b…`, `LED_DLL_forMB_x64.dll fbb5a606…`, `LED_DLL_forMB_User_x64.dll 23d648c3…`, `VGA_Extra_x64.dll 852eae26…`. Evidence IDs from the REA session: loader `ev_8059ca16…`, xrefs `ev_23836b04…`, `ev_a21466a9…`.
+
+### 5.1 The call chain is not what the task assumed (observed)
+
+`AacVgaHal_x64.dll` does **not** talk to `VGA_Extra_x64.dll`. `fn*` names are not PE exports of `AacVgaHal`; they are `GetProcAddress` strings. `DllInitialize` (`FUN_180015ec0`) loads **`LED_DLL_forMB_x64.dll`** and fills a function table:
+
+```c
+hModule = LoadLibraryA("LED_DLL_forMB_x64.dll");           // this+0x98
+this+0x08 fnEnumSupportDevice   this+0x10 fnSetLEDColor   this+0x18 fnSetAddrLEDColor
+this+0x20 fnSetLEDEFFECT        this+0x28 fnEffectReset    this+0x30 fnSetLEDFrame
+this+0x38 fnGetLEDFrame         this+0x40 fnSetLEDBurn     this+0x78 fnGetLEDDeviceSpeedLevel
+this+0x80 fnGetLEDDeviceGenerations   this+0x88 fnSetLEDDeviceEffectSpeed   this+0x90 fnSetLEDDeviceEffectDirection
+// init succeeds only if ALL of them resolve and fnEnumSupportDevice() != 0
+```
+
+Full chain (each hop observed):
+
+```
+AacVgaHal_x64.dll  --GetProcAddress-->  LED_DLL_forMB_x64.dll!fn*          (service side)
+  user-session (DAT_1802e0d22==0): jump through fn-pointers into LED_DLL_forMB_User_x64.dll
+  service mode  (DAT_1802e0d22!=0): CreateFileMappingW("Global\SetLEDFrameDataMappingObject_x64" etc.,
+                                     0x30/0x34 bytes) + SetEvent/WaitForSingleObject  -> AacVga_UserApp_x64.exe
+LED_DLL_forMB_User_x64.dll (FUN_180002720) --LoadLibraryW("VGA_Extra_x64.dll")-->
+     Set_LED_ExternalFan_Info_byCardIndex / Get_LED_ExternalFan_Info_byCardIndex   (generic 0x80-byte struct, §2.2)
+     SetLEDDeviceEffectSpeed / SetLEDDeviceEffectDirection / GetLEDDeviceGenerations / GetLEDDeviceSpeedLevel
+```
+
+So `fnSetLEDFrame`, `fnEffectReset`, `fnSetLEDBurn` and `fnSetLEDEFFECT` all funnel into the **same** generic setter `Set_LED_ExternalFan_Info_byCardIndex` (`DAT_180282f38`) and `fnGetLEDFrame`/`GetLEDColor`/`GetLEDEFFECT`/`GetLEDBurn` into the same getter (`DAT_180282f40`). Speed, direction, generation and speed-level have their own `VGA_Extra_x64.dll` exports.
+
+### 5.2 `fnSetLEDFrame` / `fnGetLEDFrame`: register `0x0C` (observed)
+
+`LED_DLL_forMB_User_x64.dll!fnSetLEDFrame` (`0x180005160`):
+
+```c
+memset(&buf, 0, 0x80);                 // the 0x80-byte struct of §2.2 (int[32])
+buf[0x10] = 1;                         // byte offset 0x40: "frame" flag
+buf[0x11] = (u8)frame;                 // byte offset 0x44: value
+if (id.dword1 == 0 && id.dword2 == 0)  // device id sanity gate (param_1[0..1] hi words must be 0)
+    Set_LED_ExternalFan_Info_byCardIndex(card = param_1+0xc, &buf);
+```
+
+In the dispatcher (§2.2) `param_2[0x10]==1` → `FUN_180005850(addr, 0x0C, &param_2[0x11], card)`. So **`fnSetLEDFrame(frame)` writes register `0x0C` ← `frame` (one byte), via the same I2C path, no other register**. `fnEffectReset` is the sibling: it sets `buf[0] = 1` (flag) and `buf[1] = 1` (data: `local_88 = CONCAT44(uStack_104, 1)` with `uStack_104 = 1`), i.e. dispatcher `param_2[0]==1` → **register `0x0D` ← 1** (`FUN_180005850(addr, 0x0d, &param_2[1], card)`). Same register the dispatcher labels `0x0D` in §2.2 (the 'sync' write).
+
+`fnGetLEDFrame` sets `buf[0x10]=1` and reads back `buf[0x11]`. In `Get_LED_ExternalFan_Info_byCardIndex` the `+0x40` flag reads **register `0x0B`**, not `0x0C` (`FUN_1800056b0(addr, 0x0b, …)`, I2C read, 5 attempts × 20 ms). That is an observed read/write asymmetry (`0x0C` write, `0x0B` read); whether `0x0B` mirrors `0x0C` on hardware is **unknown**.
+
+Parameters seen at the exported ABI (`LED_DLL_forMB_x64.dll!fnSetLEDFrame`, `0x18000c5e0`): `(DeviceId* p1, u32 frame)`. `DeviceId` is 0x28 bytes; the dword at `+0xC` is the card index; the first dword pair must be zero. In service mode the 0x30-byte shared-memory block is `{u32 1; 0x28-byte DeviceId copy; u32 frame@+0x2c}` and the user app replays it.
+
+**Callers: none.** `AacVgaHal_x64.dll` stores `fnSetLEDFrame`/`fnGetLEDFrame` (`this+0x30/0x38`) and only null-checks them; the only indirect calls through the table are `fnSetLEDColor` (`this+0x10`, an unnamed function near `0x1800164xx`) and `fnSetLEDEFFECT` (`this+0x20`, `FUN_1800164e0`). **No value for `0x0C` is ever chosen inside the HAL**, so what the frame byte means (the existing doc calls it "Synchronization control") is still not established by vendor code. Another consumer (e.g. `LightingService.exe`, not analysed) would have to supply it.
+
+### 5.3 Speed and direction (observed, `VGA_Extra_x64.dll`)
+
+```c
+// SetLEDDeviceEffectSpeed(card, value, apply)         @0x180003cc0
+// SetLEDDeviceEffectDirection(card, value, apply)     @0x180003da0
+if (cardAddr[card] == 0xCE) {                 // ENE-type GPU only
+    index  <- 0x8022 (speed)  | 0x8023 (direction)   // bytes {0x80,0x22}/{0x80,0x23}, cmd 0 = set index
+    write8 <- value                                    // cmd 1
+    if (apply == 1) { index <- 0x802F; write8 <- 1 }   // V2 apply
+}                                              // else: NO-OP (returns without any write)
+```
+
+* **Only class `0xCE` (7-bit `0x67`) does anything.** For `0x52` (our 7-bit `0x29` Strix 1060), `0x54`, `0xC0` and AMD the functions are silent no-ops. Register `0x08`..`0x0F` classic regs have **no** speed or direction field in vendor code.
+* The ENE GPU registers are the *same* `0x8022`/`0x8023` luminactl uses on the motherboard. Together with §3.5 this confirms the ENE register layout `0x8020 direct, 0x8021 mode, 0x8022 speed, 0x8023 direction, 0x802F/0x80A0 apply` as an ENE-family property (inferred for LED-0116).
+* Value mapping is **not** done in this layer; the raw byte goes straight to the register. `0-2` for speed and direction come from the ENE HAL layer (§6.3), not from the GPU DLLs.
+
+Capability queries (exact tables):
+
+| `GetLEDDeviceGenerations` | class | `*out` |
+|---|---|---|
+| | `1`(AMD) or `0xC0` | 1 |
+| | `0x52`, `0x54` | 2 |
+| | `0xCE` | 3 |
+| | other | 0 |
+
+| `GetLEDDeviceSpeedLevel` | class | `*out` |
+|---|---|---|
+| | `0x54`, `0xC0`, `0xCE` | 3 |
+| | `0x52`, `1`, other | **1** |
+
+`AacVgaHal_x64.dll` consumes only the speed level: `MyAacLedDeviceHal::CreateLedDevice` (`FUN_180010f30`) calls `fnGetLEDDeviceSpeedLevel` per card, logs `... ledCount = %d, SpeedLevel = %d`, and stores it clamped to `1..0x21` (`0` → `1`). Level 1 means "no selectable speed". **Our Strix 1060 (`0x52`) therefore reports 1 speed level, generation 2, and has no vendor GPU speed or direction control at all.** `fnSetLEDDeviceEffectSpeed`/`Direction` and `fnGetLEDDeviceGenerations` have no call sites in the HAL (resolved and null-checked only).
+
+### 5.4 Compare with `src/gpu.rs`
+
+| Aspect | Vendor | luminactl | Verdict |
+|--------|--------|-----------|---------|
+| GPU speed/direction on `0x52` | not implemented (silent no-op); speed level reported = 1 | not implemented | ✅ nothing to port |
+| GPU speed/direction on `0xCE` | `0x8022`/`0x8023` ← value, optional `0x802F ← 1` | n/a (no ENE GPU) | out of scope for this card |
+| Frame reg `0x0C` | write `0x0C ← frame`; read `0x0B` | never touched | gap, **semantics unknown**, no caller in HAL |
+| `fnEffectReset` | `0x0D ← 1` | never touched | gap, unknown effect |
+| Generations | 2 for `0x52` | none | informational only |
+| Retry | writes: 3×, 50 ms (`FUN_180005850`); reads: 5×, 20 ms (`FUN_1800056b0`) | none | add retry (see §2.7 item 4) |
+
+## 6. Official ENE Technology HAL (`ene_asm_hal/HAL_DLL_X64`)
+
+### 6.1 What the binary is (observed)
+
+`HAL_DLL_X64` (sha256 `506b9e40…`) is `AacHal_x64.dll`, PDB `D:\Work\work_2020_Q1\1_Sam\asm_1095\output\Release\x64\AacHal_x64.pdb`, signed `ENE TECHNOLOGY INC.`, COM name `ENE_EHD_ASM.Hal`, log prefix `[AURA HAL][ENE ASM]`, registry key `Software\ENE_RGB_HAL_EHD_ASM`. `x64hash.hash` pairs it with `asmtusb_x64.dll` (ASMedia's USB bridge library; `EHD_CTRL_ASMEDIA_DLL_x64` is the `Asmt*` USB-lib wrapper exporting `AsmtUSBLib_*`).
+
+**It is a USB-bridge LED controller HAL, not an SMBus driver.** There is no SMBus/SIO code, no `LED-0116`, no `0x1000..0x1007` name read, no `0x1C00` config read. Its only transport is one function:
+
+```c
+// FUN_180008600(dev, regIndex16, data*, len)        @0x180008600
+local_47 = regIndex & 0xff;  local_48 = regIndex >> 8;  local_3f = len << 8;  local_78 = 0x53;   // 'S'
+AsmtUSBLib_VENDOR_CMD(devHandle, 1 /*write*/, 0xEC, 0x41, ...);                // SCSI vendor cmd 0xEC, sub 0x41
+```
+
+`AacLedDeviceHalFactory` (COM `IClassFactory`), `MyAacLedDeviceHal` (enumerates devices through `AsmtUSBLib_vScanUSBPort`/`ScanEHD`), `MyAacLedDevice` (capabilities + colour/effect methods) and `IAacLedDeviceOptSpeed` (RTTI `.?AVIAacLedDeviceOptSpeed@@`) are present. Observed only by static reading, never run.
+
+### 6.2 Register map the binary actually contains
+
+| Immediate | Where | Meaning in this HAL |
+|-----------|-------|--------------------|
+| `0x8020` | `FUN_180008490` | 4-byte block `{direct, mode, speed, direction}` written in one transaction |
+| `0x8021`/`0x8022`/`0x8023` | same 4-byte block, bytes 1/2/3 | mode / speed / direction (**inferred from the block layout**, not separate writes) |
+| `0x802F` | `FUN_180008490` | apply: `← 1` after every update (V2 apply) |
+| `0x8100` / `0x8160` | `FUN_180009170` | colour buffer: `0x8100` direct (`param_3==0`, effect "Static"), `0x8160` effect; up to 0x18 bytes in the vendor write |
+| `0x80F2` | `FUN_180008580` | single byte, written from `FUN_18000a9d0`; unknown meaning (see 6.4) |
+| `0x80A0` | **absent** | luminactl's V1 apply is not used; this HAL is V2 |
+| `0x1C00` | **absent** | the only `0x1c00` hit is a CRT `memset` loop bound (`ene_all` line 12573) |
+| `0x1000` | **absent** | only `0x1000` is a CRT buffer size / `%s` buffer; no name read |
+
+So the "16-bit ENE register mapping" **is** partially present, but for the ASMedia/V2 layout (`0x8020…0x8023`, `0x802F`, `0x8100/0x8160`), not the V1 layout luminactl drives (`0x8000/0x8010` colour buffers, `0x80A0` apply, `0x1000` name, `0x1C00` config).
+
+Colour packing (`FUN_180009170`): input stride 4, bytes copied `out[0]=in[0]; out[2]=in[1]; out[1]=in[2]` → **R,B,G** order, same as luminactl's `pack_mobo_color` `[r,b,g]`.
+
+### 6.3 Effect IDs, speed and direction (observed)
+
+`FUN_18001ca50` (static initialiser; constructor `FUN_18000ac50(name, id, color?, speed?, dir?, maxSpeed, …, maxDirection)`) builds the effect table. Flags decoded from the constructor arguments (the `colour` column is the `+0x51` byte; **inferred** meaning "caller supplies colours"):
+
+| ID | Name | colour | speed | direction | max-dir |
+|----|------|:------:|:-----:|:---------:|:-------:|
+| 0 | Static | ✓ | – | – | – |
+| 2 | Breathing | ✓ | ✓ | – | – |
+| 3 | Strobing | ✓ | ✓ | – | – |
+| 4 | Color cycle | – | ✓ | – | – |
+| 5 | Rainbow | – | ✓ | ✓ | 1 |
+| 6 | Breath_rainbow | – | ✓ | – | – |
+| 7 | Comet | ✓ | ✓ | ✓ | 2 |
+| 8 | Rainbow_Comet | – | ✓ | ✓ | 2 |
+| 9 | Moving_Flash | ✓ | ✓ | ✓ | 2 |
+| 10 | Flash_and_Dash | – | ✓ | ✓ | 2 |
+| 11 | Wave | – | ✓ | – | – |
+| 12 | Glowing_Yoyo | – | ✓ | – | – |
+| 13 | Starry_Night | – | ✓ | – | – |
+| 0xFF | Default | – | – | – | – |
+
+IDs 2–13 match `src/protocol.rs` `MoboMode::from_code` 2–13 exactly (Breathing…RandomFlicker; our `Chase`=9, `Wave`=11, `RandomFlicker`=13 etc.) — independent confirmation of the mode vocabulary. Differences: the vendor uses **ID 0 = Static** (sent with the direct flag, buffer `0x8100`) and has no `1`; luminactl uses `0 = Off`, `1 = Static`. `ID 1` and `Off` do not exist in this table.
+
+Speed/direction wire format (`FUN_180009170`, header block `{direct, mode, speed, direction}`):
+
+```c
+direct    = (effectId == 0);                         // Static -> direct buffer 0x8100, else 0x8160
+mode      = effectId == 0xFF ? 5 : effectId;         // 0xFF "Default" is sent as mode 5
+speed     = (v < 3 || v == 0xFE || v == 0xFF) ? v : 0;   // 0x8022
+direction = (v < 3) ? v : 0;                              // 0x8023
+```
+
+* **Speed levels: `0,1,2` (and `0xFE`/`0xFF`) → `0x8022`; direction `0,1,2` → `0x8023`.** Any other value is silently replaced by `0`. Mapping onto "slow/medium/fast" and "forward/reverse/other" is *inferred* from 0-based ordering; the binary names none of them.
+* Validation (`FUN_18000a940`): `speed ≤ maxSpeed (0xFF)` and, for direction-capable effects, `speed ≤ maxDirection` (1 or 2). This looks like a vendor bug (speed compared with the direction limit) and effectively caps speed at 1 (Rainbow) or 2 (Comet…Flash_and_Dash).
+* `FUN_180009290` converts a caller time value (30 ms ticks, `t/0x1e`) per effect into one byte and sends it through vtbl slot `+0x20` → **`0x80F2 ← byte`** (effect-dependent modulus: id2 `÷188`, ids3/11 `÷50`, ids4/5 byte, 7/8 `%16` (or `%40` when flag==2) with `[3, n-3)` window, 9/10 `%30` (`%60`), 12 `%112` window `[6,106]`, 13 `%25` window `[3,21]`). Meaning of `0x80F2` is **unknown** (inferred: effect period/length).
+
+### 6.4 Compare with `src/mobo.rs`
+
+| Aspect | ENE HAL (ASM USB) | luminactl (`src/mobo.rs`, LED-0116 SMBus) | Verdict |
+|--------|--------------------|-------------------------------------------|---------|
+| Transport | ASMedia SCSI vendor cmd `0xEC/0x41`, 16-bit index | NCT6793D SMBus, 16-bit index via `0x00/0x01` | ❌ different, no sharing |
+| Direct/mode/speed/dir regs | `0x8020…0x8023` | same | ✅ same layout (ENE-family) |
+| Apply | `0x802F ← 1` (V2) | `0x80A0 ← 1` (V1) | ⚠️ per-firmware, keep V1 for LED-0116 |
+| Colour buffers | `0x8100` / `0x8160` (V2) | `0x8000` / `0x8010` (V1) | ⚠️ per-firmware |
+| Colour byte order | R,B,G | R,B,G | ✅ |
+| Mode IDs | 0 Static, 2–13, 0xFF Default | 0 Off, 1 Static, 2–13 | ✅ 2–13; ⚠️ 0/1 differ |
+| Speed values | `0,1,2,0xFE,0xFF`, else `0` | `u8` written as given | ⚠️ unvalidated in luminactl |
+| Direction values | `0,1,2`, else `0` | `u8`; status maps `0=forward`, else `reverse` | ⚠️ `2` exists vendor-side |
+| Name / config reads | none | `0x1000..`, `0x1C00..` | ❌ no vendor counterpart |
+| Save | none (`0x80F1`/`0xAA` not present) | not implemented | ✅ no conflict |
+
+### 6.5 Recommendations (mobo)
+
+1. **Clamp/validate** speed to `0..=2` (plus `0xFE`/`0xFF` only if exposed deliberately) and direction to `0..=2`; reject others instead of writing raw bytes. Vendor firmware tolerates only those values and the HAL silently zeroes the rest.
+2. **Per-mode capability table** from §6.3 (speed ✓/✗, direction ✓/✗): don't offer speed on Static, nor direction on modes 2/3/4/6/11/12/13. luminactl's `uses_color()` gating already follows the colour column.
+3. **Do not adopt** `0x802F`, `0x8100/0x8160`, `0x80F2` for LED-0116 without a hardware probe; they belong to the ASMedia/V2 firmware.
+4. Document that ENE's own HAL does **not** validate `LED-0116`; luminactl's firmware-name gate stays.
+
+## 7. Phase 2 summary table
+
+| # | Finding | Evidence | Recommendation for luminactl |
+|---|---------|----------|------------------------------|
+| P1 | `AacVgaHal_x64.dll` calls `LED_DLL_forMB_x64.dll`, not `VGA_Extra_x64.dll`; real chain is HAL → LED_DLL_forMB → (IPC or) LED_DLL_forMB_User → VGA_Extra | Observed (`FUN_180015ec0`, `FUN_180002720`) | Correct any docs that say the HAL dispatches to VGA_Extra directly |
+| P2 | `fnSetLEDFrame` writes only reg `0x0C ← frame (u8)`; `fnGetLEDFrame` reads reg **`0x0B`**; no caller supplies a value in the HAL | Observed | Keep 0x0C untouched; semantics unknown. Don't label it "sync" |
+| P3 | `fnEffectReset` writes reg `0x0D ← 1` only | Observed | Do not implement without a hardware probe |
+| P4 | GPU `SetLEDDeviceEffectSpeed/Direction` act **only** on ENE class `0xCE` (`0x8022`/`0x8023`, then `0x802F←1`); no-op on `0x52` | Observed | **No GPU speed/direction feature for the Strix 1060**; do not add flags that imply otherwise |
+| P5 | `GetLEDDeviceSpeedLevel(0x52)=1`, `Generations(0x52)=2` | Observed | Expose "speed: n/a" for the GPU in status/docs |
+| P6 | `HAL_DLL_X64` is ENE's ASMedia-USB V2 HAL (`0x8020…0x8023`, `0x802F`, `0x8100/0x8160`), not SMBus/LED-0116 | Observed | Don't cite it as ground truth for LED-0116 registers or `0x80A0`/`0x1000`/`0x1C00` |
+| P7 | Effect IDs 2–13 and R,B,G packing independently match `protocol.rs`; vendor ID 0 = Static (no Off, no ID 1) | Observed | Keep luminactl IDs; the `0=Off/1=Static` split is luminactl-specific/firmware-driven |
+| P8 | Speed `0,1,2,0xFE,0xFF` and direction `0,1,2` accepted; others → 0; speed also capped by direction limit (quirk) | Observed (clamp), Inferred (semantics) | Validate `--speed 0..=2`, direction `0..=2` in `mobo` CLI/MCP/web |
+| P9 | Per-effect speed/direction capability table | Observed | Add table to `MoboMode` (`supports_speed`, `supports_direction`) and gate in UI |
+| P10 | Unknown: meaning of `0x0C`/`0x0B`/`0x0D` on GPU, `0x80F2` on ENE ASM, speed→time mapping | Unknown | Hardware probe before any write |
+
+Bounded searches (Phase 2): register immediates searched across `ene_all` decompilation of `HAL_DLL_X64` (672 functions, all decompiled) for `0x8020…0x8023, 0x802F, 0x80A0, 0x80F1, 0x80F2, 0x1000, 0x1C00`; `AacVgaHal_x64.dll` (2476 functions) searched for indirect calls through the function table at `this+0x10..0x90`. `EHD_CTRL_ASMEDIA_DLL_x64` was only inspected by exports/strings (ASMedia `AsmtUSBLib_*` wrapper, no LED logic). `AacVga_UserApp_x64.exe` was checked only for the `fnSetLEDDeviceEffectSpeed` string xref (loader `FUN_140003f00`, same GetProcAddress pattern). Nothing was executed against hardware.
